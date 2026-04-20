@@ -1,6 +1,7 @@
 import argparse
 from pathlib import Path
 import subprocess
+import sys
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--model")
@@ -29,6 +30,9 @@ Map = {
     "hmog": "HMOGDB",
     "humi": "HuMIdb"
 }
+#it now uses the same Python interpreter that launched run.py instead of hardcoding python
+def run_python(script_path, *script_args):
+    subprocess.run([sys.executable, str(script_path), *[str(arg) for arg in script_args if arg is not None]])
 
 def validation(args):
     if (args.model not in VALID_ARG_VALUES["model"]):
@@ -48,27 +52,27 @@ if __name__ == "__main__":
         if (args.model != None):
             if (args.model == "tl"):
                 if (args.mode == "test"):
-                    subprocess.run(f"python {Map[args.model]/args.mode}.py {args.metric} {args.testfile}", shell=True)
+                    run_python(Map[args.model]/f"{args.mode}.py", args.metric, args.testfile)
                 elif (args.mode == "train"):
-                    subprocess.run(f"python {Map[args.model]/f'{args.mode}_{Map[args.dataset]}'}.py {args.epochs}", shell=True)
+                    run_python(Map[args.model]/f"{args.mode}_{Map[args.dataset]}.py", args.epochs)
                 elif (args.mode == "continue_train"):
-                    subprocess.run(f"python {Map[args.model]/f'train_{Map[args.dataset]}'}.py {args.epochs} {args.initepoch}", shell=True)
+                    run_python(Map[args.model]/f"train_{Map[args.dataset]}.py", args.epochs, args.initepoch)
             else:
                 if (args.imu != None):
                     if (args.mode == "test"):
-                        subprocess.run(f"python {Map[args.model]/Map[args.dataset]/f'imu_{args.imu}'/args.mode}.py {args.metric} {args.testfile}", shell=True)
+                        run_python(Map[args.model]/Map[args.dataset]/f"imu_{args.imu}"/f"{args.mode}.py", args.metric, args.testfile)
                     elif (args.mode == "train"):
-                        subprocess.run(f"python {Map[args.model]/Map[args.dataset]/f'imu_{args.imu}'/args.mode}.py {args.epochs}", shell=True)
+                        run_python(Map[args.model]/Map[args.dataset]/f"imu_{args.imu}"/f"{args.mode}.py", args.epochs)
                     elif (args.mode == "continue_train"):
-                        subprocess.run(f"python {Map[args.model]/Map[args.dataset]/f'imu_{args.imu}'}/train.py {args.epochs} {args.initepoch}", shell=True)
+                        run_python(Map[args.model]/Map[args.dataset]/f"imu_{args.imu}"/"train.py", args.epochs, args.initepoch)
                 else:
                     if (args.mode == "test"):
-                        subprocess.run(f"python {Map[args.model]/Map[args.dataset]/args.mode}.py {args.metric} {args.testfile}", shell=True)
+                        run_python(Map[args.model]/Map[args.dataset]/f"{args.mode}.py", args.metric, args.testfile)
                     elif (args.mode == "train"):
-                        subprocess.run(f"python {Map[args.model]/Map[args.dataset]/args.mode}.py {args.epochs}", shell=True)
+                        run_python(Map[args.model]/Map[args.dataset]/f"{args.mode}.py", args.epochs)
                     elif (args.mode == "continue_train"):
-                        subprocess.run(f"python {Map[args.model]/Map[args.dataset]}/train.py {args.epochs} {args.initepoch}", shell=True)
+                        run_python(Map[args.model]/Map[args.dataset]/"train.py", args.epochs, args.initepoch)
         else:
-            subprocess.run(f"python {str((Path(__file__)/'../').resolve())}/data/{Map[args.dataset]}/{args.mode}.py", shell=True)
+            run_python((Path(__file__)/'../').resolve()/"data"/Map[args.dataset]/f"{args.mode}.py")
     else:
         raise ValueError("Please give correct values for arguments")
