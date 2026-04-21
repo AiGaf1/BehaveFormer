@@ -1,14 +1,14 @@
 import math
 import pickle
 import subprocess
-from pathlib import Path
 import sys
 import time
-from torch import nn
-import torch
-from torch.utils.data import Dataset, DataLoader
+from pathlib import Path
 
 import numpy as np
+import torch
+from torch import nn
+from torch.utils.data import Dataset, DataLoader
 
 from model import Model
 sys.path.append(str((Path(__file__)/"../../../../../utils").resolve()))
@@ -16,225 +16,235 @@ sys.path.append(str((Path(__file__)/"../../../../../evaluation").resolve()))
 from Config import Config
 from metrics import Metric
 
+# ── Constants ────────────────────────────────────────────────────────────────
+
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+HERE = Path(__file__).parent
+
+
+# ── Data helpers ──────────────────────────────────────────────────────────────
+
 def scale(data):
+    """Normalise keystroke and IMU arrays in-place."""
     for user in data:
         for session in user:
-            for i in range(len(session)):
-                # Keystroke scaling
-                for j in range(10):
-                    if (j == 9):
-                        # key code
-                        session[i][0][:, j] = session[i][0][:, j] / 255
-                    else:
-                        session[i][0][:, j] = session[i][0][:, j] / 1000
-                        
-                # IMU scaling
-                for j in range(36):
-                    if (j == 0 or j == 1 or j == 2):
-                        session[i][1][:, j] = session[i][1][:, j] / 10
-                    elif (j == 3 or j == 4 or j == 5 or j == 15 or j == 16 or j == 17):
-                        session[i][1][:, j] = session[i][1][:, j] / 1000
-                    elif (j == 24 or j == 25 or j == 26):
-                        session[i][1][:, j] = session[i][1][:, j] / 100
-                    elif (j == 27 or j == 28 or j == 29):
-                        session[i][1][:, j] = session[i][1][:, j] / 10000
+            for i, (ks, imu) in enumerate(session):
+                ks = np.array(ks, dtype=np.float32)
+                imu = np.array(imu, dtype=np.float32)
+
+                ks[:, :9]  /= 1_000
+                ks[:, 9]   /= 255
+
+                imu[:, [0, 1, 2]]            /= 10
+                imu[:, [3, 4, 5, 15, 16, 17]] /= 1_000
+                imu[:, [24, 25, 26]]          /= 100
+                imu[:, [27, 28, 29]]          /= 10_000
+
+                np.nan_to_num(ks,  copy=False)
+                np.nan_to_num(imu, copy=False)
+                session[i] = [ks, imu]
+
+
+def load_pickle(path):
+    with open(path, "rb") as f:
+        return pickle.load(f)
+
+
+# ── Datasets ──────────────────────────────────────────────────────────────────
 
 class TrainDataset(Dataset):
-    def __init__(self, training_data, batch_size, epoch_batch_count):
-        self.training_data = training_data
-        self.batch_size = batch_size
-        self.epoch_batch_count = epoch_batch_count
+    """Yields random (anchor, positive, negative) triplets."""
+
+    def __init__(self, data, batch_size, epoch_batch_count):
+        self.data = data
+        self.length = batch_size * epoch_batch_count
+        self.n_users = len(data)
+        self.n_sessions = len(data[0])
 
     def __len__(self):
-        return self.batch_size * self.epoch_batch_count;
+        return self.length
 
-    def __getitem__(self, idx):
-        genuine_user_idx = np.random.randint(0, len(self.training_data))
-        imposter_user_idx = np.random.randint(0, len(self.training_data))
-        while (imposter_user_idx == genuine_user_idx):
-            imposter_user_idx = np.random.randint(0, len(self.training_data))
-        
-        genuine_sess_1 = np.random.randint(0, len(self.training_data[0]))
-        genuine_sess_2 = np.random.randint(0, len(self.training_data[0]))
-        while (genuine_sess_2 == genuine_sess_1):
-            genuine_sess_2 = np.random.randint(0, len(self.training_data[0]))
-        imposter_sess = np.random.randint(0, len(self.training_data[0]))
-        
-        genuine_seq_1 = np.random.randint(0, len(self.training_data[genuine_user_idx][genuine_sess_1]))
-        genuine_seq_2 = np.random.randint(0, len(self.training_data[genuine_user_idx][genuine_sess_2]))
-        imposter_seq = np.random.randint(0, len(self.training_data[imposter_user_idx][imposter_sess]))
+    def __getitem__(self, _):
+        rng = np.random.randint  # shorthand
 
-        anchor = self.training_data[genuine_user_idx][genuine_sess_1][genuine_seq_1]
-        positive = self.training_data[genuine_user_idx][genuine_sess_2][genuine_seq_2]
-        negative = self.training_data[imposter_user_idx][imposter_sess][imposter_seq]
+        g = rng(0, self.n_users)
+        imp = rng(0, self.n_users - 1)
+        if imp >= g:
+            imp += 1  # guaranteed different, no loop needed
+
+        s1, s2 = np.random.choice(self.n_sessions, size=2, replace=False)
+        si = rng(0, self.n_sessions)
+
+        anchor   = self.data[g][s1][rng(0, len(self.data[g][s1]))]
+        positive = self.data[g][s2][rng(0, len(self.data[g][s2]))]
+        negative = self.data[imp][si][rng(0, len(self.data[imp][si]))]
 
         return anchor, positive, negative
 
+
 class TestDataset(Dataset):
-    def __init__(self, eval_data):
-        self.eval_data = eval_data
-        self.num_sessions = len(self.eval_data[0])
-        self.num_seqs = len(self.eval_data[0][0])
+    """Flattens eval data into (user × session × sequence) items."""
+
+    def __init__(self, data):
+        if len(data) < 2:
+            raise ValueError("Evaluation needs at least 2 users.")
+        self.data = data
+        self.n_sessions = len(data[0])
+        self.n_seqs = min(len(s) for u in data for s in u)
+        if self.n_sessions == 0 or self.n_seqs == 0:
+            raise ValueError("Evaluation data must have at least one session and sequence.")
 
     def __len__(self):
-        return  math.ceil(len(self.eval_data) * self.num_sessions * self.num_seqs);
+        return len(self.data) * self.n_sessions * self.n_seqs
 
     def __getitem__(self, idx):
-        t_session = idx // self.num_seqs
-        user_idx = t_session // self.num_sessions
-        session_idx = t_session % self.num_sessions
-        seq_idx = idx % self.num_seqs
+        user    = idx // (self.n_sessions * self.n_seqs)
+        session = (idx // self.n_seqs) % self.n_sessions
+        seq     = idx % self.n_seqs
+        return self.data[user][session][seq]
 
-        return self.eval_data[user_idx][session_idx][seq_idx]
-    
+
+# ── Loss ──────────────────────────────────────────────────────────────────────
+
 class TripletLoss(nn.Module):
     def __init__(self, margin=1.0):
-        super(TripletLoss, self).__init__()
+        super().__init__()
         self.margin = margin
-        
-    def calc_euclidean(self, x1, x2):
-        return (x1 - x2).pow(2).sum(dim=1).sqrt()
-    
-    def calc_cosine(self, x1, x2):
-        dot_product_sum = (x1*x2).sum(dim=1)
-        norm_multiply = (x1.pow(2).sum(dim=1).sqrt()) * (x2.pow(2).sum(dim=1).sqrt())
-        return dot_product_sum / norm_multiply
-    
-    def calc_manhattan(self, x1, x2):
-        return (x1-x2).abs().sum(dim=1)
-    
+
     def forward(self, anchor, positive, negative):
-        distance_positive = self.calc_euclidean(anchor, positive)
-        distance_negative = self.calc_euclidean(anchor, negative)
-        losses = torch.relu(distance_positive - distance_negative + self.margin)
+        d_pos = (anchor - positive).pow(2).sum(dim=1).sqrt()
+        d_neg = (anchor - negative).pow(2).sum(dim=1).sqrt()
+        return torch.relu(d_pos - d_neg + self.margin).mean()
 
-        return losses.mean()
 
-def evaluate(model, testing_data, batch_size, trg_len, number_of_enrollment_sessions, number_of_verify_sessions):
-    model.train(False)
+# ── Evaluation ────────────────────────────────────────────────────────────────
 
-    t_dataset = TestDataset(testing_data)
-    t_dataloader = DataLoader(t_dataset, batch_size=batch_size)
-    with torch.no_grad():
-        feature_embeddings = []
-        for batch_idx, item in enumerate(t_dataloader):
-            feature_embeddings.append(model([item[0].float(), item[1].float()]))
+@torch.no_grad()
+def evaluate(model, data, batch_size, trg_len, n_enroll, n_verify):
+    model.eval()
+    loader = DataLoader(TestDataset(data), batch_size=batch_size)
 
-    eer = Metric.cal_user_eer(torch.cat(feature_embeddings, dim=0).view(len(testing_data), len(testing_data[0]), len(testing_data[0][0]), trg_len), number_of_enrollment_sessions, number_of_verify_sessions, "hmog")[0]
-    return eer
+    embeddings = torch.cat(
+        [model([b[0].float().to(DEVICE), b[1].float().to(DEVICE)]) for b in loader]
+    )
 
-if __name__ == "__main__":
-    config=Config()
-    data = config.get_config_dict()["data"]
-    hyperparams = config.get_config_dict()["hyperparams"]
+    n_users, n_sessions, n_seqs = len(data), loader.dataset.n_sessions, loader.dataset.n_seqs
+    embeddings = embeddings.view(n_users, n_sessions, n_seqs, trg_len)
 
-    train_id = config.get_config_dict()["preprocessed_data"]["hmog"]["train"]
-    test_id = config.get_config_dict()["preprocessed_data"]["hmog"]["test"]
-    val_id = config.get_config_dict()["preprocessed_data"]["hmog"]["val"]
+    n_verify = min(n_verify, n_sessions - n_enroll)
+    return Metric.cal_user_eer(embeddings, n_enroll, n_verify, "hmog")[0]
 
-    subprocess.run(f"gdown {train_id}", shell=True)
-    subprocess.run(f"gdown {test_id}", shell=True)
-    subprocess.run(f"gdown {val_id}", shell=True)
 
-    if(config.get_config_dict()["GPU"] == "True"):
-        torch.set_default_tensor_type('torch.cuda.FloatTensor')
+# ── Training loop ─────────────────────────────────────────────────────────────
 
-    infile = open("training_keystroke_imu_data_all.pickle",'rb')
-    training_data = pickle.load(infile)
-    infile.close()
+def train(model, dataloader, optimizer, loss_fn):
+    model.train()
+    total_loss = 0.0
+    for anchor, positive, negative in dataloader:
+        a = model([anchor[0].float().to(DEVICE),   anchor[1].float().to(DEVICE)])
+        p = model([positive[0].float().to(DEVICE), positive[1].float().to(DEVICE)])
+        n = model([negative[0].float().to(DEVICE), negative[1].float().to(DEVICE)])
 
-    infile = open("validation_keystroke_imu_data_all.pickle",'rb')
-    validation_data = pickle.load(infile)
-    infile.close()
+        loss = loss_fn(a, p, n)
+        optimizer.zero_grad(set_to_none=True)   # faster than zero_grad()
+        loss.backward()
+        optimizer.step()
+        total_loss += loss.item()
 
-    infile = open("testing_keystroke_imu_data_all.pickle",'rb')
-    testing_data = pickle.load(infile)
-    infile.close()
+    return total_loss / len(dataloader)
 
+
+# ── Entry point ───────────────────────────────────────────────────────────────
+
+def main():
+    config = Config()
+    cfg = config.get_config_dict()
+    data_cfg = cfg["data"]
+    hp = cfg["hyperparams"]
+    ids = cfg["preprocessed_data"]["hmog"]
+ 
+    data_files = [
+        (ids["train"], Path("data/HMOGDB/prep_data/training_keystroke_imu_data_all.pickle")),
+        (ids["test"],  Path("data/HMOGDB/prep_data/testing_keystroke_imu_data_all.pickle")),
+        (ids["val"],   Path("data/HMOGDB/prep_data/validation_keystroke_imu_data_all.pickle")),
+    ]
+    for gid, path in data_files:
+        if gid and not path.exists():
+            subprocess.run(f"gdown {gid}", shell=True, check=True)
+ 
+    training_data   = load_pickle("data/HMOGDB/prep_data/training_keystroke_imu_data_all.pickle")
+    validation_data = load_pickle("data/HMOGDB/prep_data/validation_keystroke_imu_data_all.pickle")
+ 
+    # Limit validation sequences
     for user in validation_data:
         for idx, session in enumerate(user):
             user[idx] = session[:50]
-
-    scale(validation_data)
+ 
     scale(training_data)
-
-    batch_size = hyperparams["batch_size"]["hmog"]
-    epoch_batch_count = hyperparams["epoch_batch_count"]["hmog"]
-    keystroke_l = data["keystroke_sequence_len"]
-    imu_l = data["imu_sequence_len"]
-    keystroke_feature_count = hyperparams["keystroke_feature_count"]["hmog"]
-    imu_feature_count = hyperparams["imu_feature_count"]["all"]
-    trg_len = hyperparams["target_len"]
-    number_of_enrollment_sessions = hyperparams["number_of_enrollment_sessions"]["hmog"]
-    number_of_verify_sessions = hyperparams["number_of_verify_sessions"]["hmog"]
-
-    best_model_save_path = f'{str((Path(__file__)/"../").resolve())}/best_models'
-    checkpoint_save_path = f'{str((Path(__file__)/"../").resolve())}/checkpoints'
-
-    subprocess.run(f"mkdir {best_model_save_path}", shell=True)
-    subprocess.run(f"mkdir {checkpoint_save_path}", shell=True)
-
-    dataset = TrainDataset(training_data, batch_size, epoch_batch_count)
-    dataloader = DataLoader(dataset, batch_size=batch_size)
-    model = Model(keystroke_feature_count, imu_feature_count, keystroke_l, imu_l, trg_len)
-
-    loss_fn = TripletLoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=hyperparams["learning_rate"])
-
-    g_eer = math.inf
-    epochs = int(sys.argv[1])
-    init_epoch = 0
-
-    if (len(sys.argv) > 2):
-        if (config.get_config_dict()["GPU"] == "True"):
-            checkpoint = torch.load(f"{checkpoint_save_path}/training_{sys.argv[2]}.tar")
-        else:
-            checkpoint = torch.load(f"{checkpoint_save_path}/training_{sys.argv[2]}.tar", map_location=torch.device('cpu'))
-        model.load_state_dict(checkpoint['model_state_dict'])
-        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        init_epoch = checkpoint['epoch']
-        init_eer = checkpoint['eer']
-
-        epochs = init_epoch + epochs
-        g_eer = init_eer
-
-    for i in range(init_epoch, epochs):
-        t_loss = 0.0
-        start = time.time()
-        model.train(True)
-        for batch_idx, item in enumerate(dataloader):
-            anchor, positive, negative = item
-            optimizer.zero_grad()
-            anchor_out = model([anchor[0].float(), anchor[1].float()])
-            positive_out = model([positive[0].float(), positive[1].float()])
-            negative_out = model([negative[0].float(), negative[1].float()])
-            loss = loss_fn(anchor_out, positive_out, negative_out)
-            loss.backward()
-            optimizer.step()
-            
-            t_loss = t_loss + loss.item()
-            if batch_idx == len(dataloader)-1:
-                t_loss = t_loss / len(dataloader)
-    
-        eer = evaluate(model, validation_data, batch_size, trg_len, number_of_enrollment_sessions, number_of_verify_sessions)
-        end = time.time()
-        print(f"------> Epoch No: {i+1} - Loss: {t_loss:>7f} - EER: {eer:>7f} - Time: {end-start:>2f}")
-        if (eer < g_eer):
-            print(f"EER improved from {g_eer} to {eer}")
-            g_eer = eer
-            torch.save(model, best_model_save_path + f"/epoch_{i+1}_eer_{eer}.pt")
-            
-        if ((i+1) % 50 == 0):
+    scale(validation_data)
+ 
+    batch_size      = hp["batch_size"]["hmog"]
+    trg_len         = hp["target_len"]
+    n_enroll        = hp["number_of_enrollment_sessions"]["hmog"]
+    n_verify        = hp["number_of_verify_sessions"]["hmog"]
+ 
+    best_dir  = HERE / "best_models"
+    ckpt_dir  = HERE / "checkpoints"
+    best_dir.mkdir(exist_ok=True)
+    ckpt_dir.mkdir(exist_ok=True)
+ 
+    model = Model(
+        hp["keystroke_feature_count"]["hmog"],
+        hp["imu_feature_count"]["all"],
+        data_cfg["keystroke_sequence_len"],
+        data_cfg["imu_sequence_len"],
+        trg_len,
+    ).to(DEVICE)
+ 
+    optimizer = torch.optim.Adam(model.parameters(), lr=hp["learning_rate"])
+    loss_fn   = TripletLoss()
+ 
+    total_epochs = int(sys.argv[1])
+    start_epoch  = 0
+    best_eer     = math.inf
+ 
+    if len(sys.argv) > 2:
+        ckpt = torch.load(ckpt_dir / f"training_{sys.argv[2]}.tar", map_location=DEVICE)
+        model.load_state_dict(ckpt["model_state_dict"])
+        optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+        start_epoch  = ckpt["epoch"]
+        best_eer     = ckpt["eer"]
+        total_epochs += start_epoch
+ 
+    dataset    = TrainDataset(training_data, batch_size, hp["epoch_batch_count"]["hmog"])
+    dataloader = DataLoader(dataset, batch_size=batch_size, pin_memory=True, num_workers=4)
+ 
+    for epoch in range(start_epoch, total_epochs):
+        t0   = time.time()
+        loss = train(model, dataloader, optimizer, loss_fn)
+        eer  = evaluate(model, validation_data, batch_size, trg_len, n_enroll, n_verify)
+        print(f"Epoch {epoch+1:>4d} | loss {loss:.6f} | EER {eer:.6f} | {time.time()-t0:.1f}s")
+ 
+        if eer < best_eer:
+            print(f"  ↳ EER improved {best_eer:.6f} → {eer:.6f}")
+            best_eer = eer
+            torch.save(model, best_dir / f"epoch_{epoch+1}_eer_{eer}.pt")
+ 
+        if (epoch + 1) % 50 == 0:
             torch.save({
-                'epoch': i+1,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'eer': g_eer
-            }, f"{checkpoint_save_path}/training_{i+1}.tar")
-            
+                "epoch": epoch + 1,
+                "model_state_dict": model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "eer": best_eer,
+            }, ckpt_dir / f"training_{epoch+1}.tar")
+ 
     torch.save({
-        'epoch': epochs,
-        'model_state_dict': model.state_dict(),
-        'optimizer_state_dict': optimizer.state_dict(),
-        'eer': g_eer
-    }, f"{checkpoint_save_path}/training_{epochs}.tar")
+        "epoch": total_epochs,
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "eer": best_eer,
+    }, ckpt_dir / f"training_{total_epochs}.tar")
+ 
+ 
+if __name__ == "__main__":
+    main()

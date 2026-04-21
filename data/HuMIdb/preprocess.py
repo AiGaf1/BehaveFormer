@@ -4,6 +4,8 @@ import pandas as pd
 import os
 import pickle
 import re
+import shutil
+import subprocess
 import numpy as np
 import zipfile
 import math
@@ -16,13 +18,13 @@ sys.path.append(str((Path(__file__)/"../../../utils").resolve()))
 from Config import Config
 
 def extract_zip(zippedFile, toFolder):
-    # Unzip a zip file and its contents, including nested zip files
-    with zipfile.ZipFile(zippedFile, 'r') as zfile:
-        zfile.extractall(path=toFolder)
-    for filePath in zipfile.ZipFile(zippedFile).namelist():
-        if re.search(r'\.zip$', filePath):
-            completePath = os.path.join(toFolder, filePath)
-            extract_zip(completePath, os.path.dirname(completePath))
+    if shutil.which("7z") is None:
+        raise RuntimeError("7z is required. Install it with: sudo apt-get install -y p7zip-full")
+
+    # Extract the main archive, then extract any nested zip files.
+    subprocess.run(["7z", "x", "-y", f"-o{toFolder}", str(zippedFile)], check=True)
+    for filePath in Path(toFolder).rglob("*.zip"):
+        subprocess.run(["7z", "x", "-y", f"-o{filePath.parent}", str(filePath)], check=True)
 
 def extract(absolute_path):
     dataset_location = Path(absolute_path)
@@ -323,38 +325,35 @@ if __name__ == "__main__":
     # Whether you want to extract the dataset
     extract_dataset = True
 
-    # Whether you want to save the generated data files into google drive
-    save_in_google_drive = True
-    
     if (download_dataset):
-        status = os.system(f"wget {dataset_url} --user={username} --password={password}")
-        if (status != 0):
-            print("Having an issue to download the dataset.")
-        else:
-            print("Download completed!")
+        wget_command = ["wget", "-c", "-O", "HuMI.zip"]
+        if username:
+            wget_command.append(f"--user={username}")
+        if password:
+            wget_command.append(f"--password={password}")
+        wget_command.append(dataset_url)
+        subprocess.run(wget_command, check=True)
+        print("Download completed!")
 
     if (extract_dataset):
-        extract("/content/HuMI.zip")
+        extract("HuMI.zip")
 
     user_list = get_filtered_users()
 
     training_user_list, val_test_user_list = train_test_split(user_list, test_size=130, train_size=298, shuffle=True)
     validation_user_list, testing_user_list = train_test_split(val_test_user_list, test_size=65, train_size=65, shuffle=True)
 
-    training_keystroke_imu_data = read_keystroke("/content/dataset", training_user_list)
+    training_keystroke_imu_data = read_keystroke("dataset", training_user_list)
     outfile = open(f"training_keystroke_imu_data_all.pickle",'wb')
     pickle.dump(training_keystroke_imu_data, outfile)
     outfile.close()
-    os.system(f"cp /content/training_keystroke_imu_data_all.pickle /content/drive/MyDrive/HuMI_Dataset/")
 
-    validation_keystroke_imu_data = read_keystroke("/content/dataset", validation_user_list)
+    validation_keystroke_imu_data = read_keystroke("dataset", validation_user_list)
     outfile = open("validation_keystroke_imu_data_all.pickle",'wb')
     pickle.dump(validation_keystroke_imu_data, outfile)
     outfile.close()
-    os.system(f"cp /content/validation_keystroke_imu_data_all.pickle /content/drive/MyDrive/HuMI_Dataset/")
 
-    testing_keystroke_imu_data = read_keystroke("/content/dataset", testing_user_list)
+    testing_keystroke_imu_data = read_keystroke("dataset", testing_user_list)
     outfile = open("testing_keystroke_imu_data_all.pickle",'wb')
     pickle.dump(testing_keystroke_imu_data, outfile)
     outfile.close()
-    os.system(f"cp /content/testing_keystroke_imu_data_all.pickle /content/drive/MyDrive/HuMI_Dataset/")

@@ -1,399 +1,336 @@
-import json    
-from pathlib import Path
-import shutil
-import pandas as pd
+import math
 import os
 import pickle
-import re
+import shutil
+import subprocess
+from pathlib import Path
+
 import numpy as np
-import zipfile
-import math
+import pandas as pd
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
-import matplotlib.pyplot as mp
 
 import sys
-sys.path.append(str((Path(__file__)/"../../../utils").resolve()))
+sys.path.append(str(Path(__file__).resolve().parents[2] / "utils"))
 from Config import Config
 
-from Config import Config
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+DOWNLOAD_FILE = PROJECT_ROOT / "download"
+DATASET_DIR   = PROJECT_ROOT / "dataset"
 
-def extract_zip(zippedFile, toFolder):
-    # Unzip a zip file and its contents, including nested zip files
-    with zipfile.ZipFile(zippedFile, 'r') as zfile:
-        zfile.extractall(path=toFolder)
-    for filePath in zipfile.ZipFile(zippedFile).namelist():
-        if re.search(r'\.zip$', filePath):
-            completePath = os.path.join(toFolder, filePath)
-            extract_zip(completePath, os.path.dirname(completePath))
+IMU_PREFIXES  = ["a", "g", "m"]
+IMU_COLUMNS   = ["x", "y", "z", "fft_x", "fft_y", "fft_z", "fd_x", "fd_y", "fd_z", "sd_x", "sd_y", "sd_z"]
+IMU_FULL_COLS = [f"{p}_{c}" for p in IMU_PREFIXES for c in IMU_COLUMNS]
+
+
+# ── Download / extraction ────────────────────────────────────────────────────
+
+def download_dataset_file(dataset_url, output_path=DOWNLOAD_FILE):
+    if not dataset_url:
+        raise ValueError("HMOG dataset_url is empty. Add a valid download URL in config.json.")
+    if output_path.exists() and output_path.stat().st_size > 0:
+        print(f"INFO: Using existing dataset archive: {output_path}")
+        return
+    subprocess.run(["wget", "-c", "-O", str(output_path), dataset_url], check=True)
+    print("Download completed!")
+
+
+def extract_zip(zipped_file, to_folder):
+    if shutil.which("7z") is None:
+        raise RuntimeError("7z is required. Install it with: sudo apt-get install -y p7zip-full")
+    subprocess.run(["7z", "x", "-y", f"-o{to_folder}", str(zipped_file)], check=True)
+    for file_path in Path(to_folder).rglob("*.zip"):
+        subprocess.run(["7z", "x", "-y", f"-o{file_path.parent}", str(file_path)], check=True)
+
 
 def extract(absolute_path):
-    dataset_location = Path(absolute_path)
-    extract_location = dataset_location.parent/"dataset"
-    print("Extracting...🚀")
-    extract_zip(dataset_location, extract_location)
-    print(f"File is unzipped in {extract_location} folder✅")
-    return extract_location
+    print("Extracting... 🚀")
+    extract_zip(Path(absolute_path), DATASET_DIR)
+    print(f"File is unzipped in {DATASET_DIR} folder ✅")
+    return DATASET_DIR
+
 
 def get_filtered_users():
-    shutil.rmtree("/content/dataset/public_dataset/733162") 
+    shutil.rmtree(DATASET_DIR / "public_dataset" / "733162", ignore_errors=True)
+
+
+# ── Keystroke processing ─────────────────────────────────────────────────────
 
 def check_couple_order(dataset, index):
-    if (dataset.at[index, "press_type"] == 0):
-        if (dataset.at[index, "event_time"] < dataset.at[index + 1, "event_time"]):
+    """Ensure a key-down event precedes its key-up partner at `index`."""
+    press_first = dataset.at[index, "press_type"] == 0
+
+    if press_first:
+        if dataset.at[index, "event_time"] < dataset.at[index + 1, "event_time"]:
             dataset.at[index, "press_type"] = 1
             dataset.at[index + 1, "press_type"] = 0
         else:
-            temp = dataset.loc[index]
-            dataset.loc[index] = dataset.loc[index + 1]
-            dataset.loc[index + 1] = temp
+            dataset.loc[index], dataset.loc[index + 1] = dataset.loc[index + 1].copy(), dataset.loc[index].copy()
     else:
-        if (dataset.at[index, "event_time"] > dataset.at[index + 1, "event_time"]):
+        if dataset.at[index, "event_time"] > dataset.at[index + 1, "event_time"]:
             dataset.at[index, "press_type"] = 0
             dataset.at[index + 1, "press_type"] = 1
-            temp = dataset.loc[index]
-            dataset.loc[index] = dataset.loc[index + 1]
-            dataset.loc[index + 1] = temp
+            dataset.loc[index], dataset.loc[index + 1] = dataset.loc[index + 1].copy(), dataset.loc[index].copy()
+
 
 def generate_couple(datasets):
-        for i in range(len(datasets)):
-            length = datasets[i].shape[0]
-            index=0
-            while(index < length):
-                if (index == length-1):
-                    datasets[i].loc[index + 0.5] = [datasets[i].at[index, "event_time"], 1 - int(datasets[i].at[index, "press_type"]), datasets[i].at[index, "key_code"], datasets[i].at[index, "user_id"]]
-                    datasets[i] = datasets[i].sort_index().reset_index(drop=True)
-                    check_couple_order(datasets[i], index)
+    """Pair every key-down event with a matching key-up event."""
+    for df in datasets:
+        index = 0
+        while index < len(df):
+            last = index == len(df) - 1
+            mismatched = not last and (
+                df.at[index, "key_code"] != df.at[index + 1, "key_code"]
+                or df.at[index, "press_type"] == df.at[index + 1, "press_type"]
+            )
+
+            if last or mismatched:
+                df.loc[index + 0.5] = [
+                    df.at[index, "event_time"],
+                    1 - int(df.at[index, "press_type"]),
+                    df.at[index, "key_code"],
+                    df.at[index, "user_id"],
+                ]
+                df.sort_index(inplace=True)
+                df.reset_index(drop=True, inplace=True)
+                check_couple_order(df, index)
+                if last:
                     break
-                else:
-                    if ((datasets[i].at[index, "key_code"] != datasets[i].at[index + 1, "key_code"]) or (datasets[i].at[index, "press_type"] == datasets[i].at[index + 1, "press_type"])):
-                        datasets[i].loc[index + 0.5] = [datasets[i].at[index, "event_time"], 1 - int(datasets[i].at[index, "press_type"]), datasets[i].at[index, "key_code"], datasets[i].at[index, "user_id"]]
-                        datasets[i] = datasets[i].sort_index().reset_index(drop=True)
-                        length = datasets[i].shape[0]
-                    check_couple_order(datasets[i], index)
-                    index = index + 2
+
+            check_couple_order(df, index)
+            index += 2
+
 
 def shrink_couple_data(keystroke_df):
-    length = keystroke_df.shape[0]
-    if length % 2 != 0:
-        print("ERROR: Keystroke Data Should Contain Couples")
-        exit()
+    """Collapse paired (press, release) rows into a single row with both timestamps."""
+    if len(keystroke_df) % 2 != 0:
+        raise ValueError("Keystroke data must contain an even number of rows (press/release pairs).")
 
-    drop_indices = []
-    i = 0
-    while(i < length):
-        next_key_event_time = keystroke_df.iloc[i + 1]["event_time"]
-        keystroke_df.at[i, 'release_time'] = next_key_event_time
-        drop_indices.append(i + 1)
+    release_times = keystroke_df.iloc[1::2]["event_time"].values
+    keystroke_df = keystroke_df.iloc[::2].copy()
+    keystroke_df["release_time"] = release_times
+    keystroke_df.rename(columns={"event_time": "press_time"}, inplace=True)
+    keystroke_df.drop(columns=["press_type"], inplace=True)
+    keystroke_df.reset_index(drop=True, inplace=True)
+    return keystroke_df
 
-        i = i + 2
 
-    keystroke_df.drop(keystroke_df.index[drop_indices], inplace=True)
-    keystroke_df.rename(columns = {'event_time':'press_time'}, inplace = True)
-    del keystroke_df["press_type"]
-    keystroke_df.reset_index(inplace = True, drop = True)
+# ── Feature extraction ───────────────────────────────────────────────────────
 
 def keystroke_feature_extract(keystroke):
-    if (keystroke.isnull().values.any()):
-        print("WARNING: Original keystroke datframe contains NaN")
-        keystroke.replace(np.nan, 0, inplace=True)
+    if keystroke.isnull().values.any():
+        print("WARNING: Original keystroke dataframe contains NaN")
+        keystroke.fillna(0, inplace=True)
+
     keystroke["press_time"] = keystroke["press_time"].astype(int)
-    for i in range(keystroke.shape[0]):
-        hl = keystroke.iloc[i]["release_time"] - keystroke.iloc[i]["press_time"]
-        key = keystroke.iloc[i]["key_code"]
-        di_ud = 0.0
-        di_dd = 0.0
-        di_uu = 0.0
-        di_du = 0.0
-        tri_ud = 0.0
-        tri_dd = 0.0
-        tri_uu = 0.0
-        tri_du = 0.0
+    n = len(keystroke)
 
-        if (i < keystroke.shape[0] - 1):
-            di_ud = keystroke.iloc[i+1]["press_time"] - keystroke.iloc[i]["release_time"]
-            di_dd = keystroke.iloc[i+1]["press_time"] - keystroke.iloc[i]["press_time"]
-            di_uu = keystroke.iloc[i+1]["release_time"] - keystroke.iloc[i]["release_time"]
-            di_du = keystroke.iloc[i+1]["release_time"] - keystroke.iloc[i]["press_time"]
+    # Vectorised hold-latency
+    keystroke["hl"]  = keystroke["release_time"] - keystroke["press_time"]
+    keystroke["key"] = keystroke["key_code"]
 
-        if (i < keystroke.shape[0] - 2):
-            tri_ud = keystroke.iloc[i+2]["press_time"] - keystroke.iloc[i]["release_time"]
-            tri_dd = keystroke.iloc[i+2]["press_time"] - keystroke.iloc[i]["press_time"]
-            tri_uu = keystroke.iloc[i+2]["release_time"] - keystroke.iloc[i]["release_time"]
-            tri_du = keystroke.iloc[i+2]["release_time"] - keystroke.iloc[i]["press_time"]
+    # Digraph timings (shifted by 1)
+    keystroke["di_ud"] = keystroke["press_time"].shift(-1)   - keystroke["release_time"]
+    keystroke["di_dd"] = keystroke["press_time"].shift(-1)   - keystroke["press_time"]
+    keystroke["di_uu"] = keystroke["release_time"].shift(-1) - keystroke["release_time"]
+    keystroke["di_du"] = keystroke["release_time"].shift(-1) - keystroke["press_time"]
 
-        keystroke.loc[i, ["hl", "di_ud", "di_dd", "di_uu", "di_du", "tri_ud", "tri_dd", "tri_uu", "tri_du", "key"]] = [hl, di_ud, di_dd, di_uu, di_du, tri_ud, tri_dd, tri_uu, tri_du, key]
+    # Trigraph timings (shifted by 2)
+    keystroke["tri_ud"] = keystroke["press_time"].shift(-2)   - keystroke["release_time"]
+    keystroke["tri_dd"] = keystroke["press_time"].shift(-2)   - keystroke["press_time"]
+    keystroke["tri_uu"] = keystroke["release_time"].shift(-2) - keystroke["release_time"]
+    keystroke["tri_du"] = keystroke["release_time"].shift(-2) - keystroke["press_time"]
+
+    # Last rows have no valid future context → zero-fill
+    keystroke.iloc[-1, keystroke.columns.get_loc("di_ud"):] = 0
+    keystroke.iloc[-2, keystroke.columns.get_loc("tri_ud"):] = 0
+    keystroke.fillna(0, inplace=True)
 
     return keystroke
 
-def imu_feature_extract(imu_type_data):
-    imu_type_data["fft_x"] = np.abs(np.fft.fft(imu_type_data["x"].values))
-    imu_type_data["fft_y"] = np.abs(np.fft.fft(imu_type_data["y"].values))
-    imu_type_data["fft_z"] = np.abs(np.fft.fft(imu_type_data["z"].values))
 
-    imu_type_data["fd_x"] = np.gradient(imu_type_data["x"].values, edge_order=2)
-    imu_type_data["fd_y"] = np.gradient(imu_type_data["y"].values, edge_order=2)
-    imu_type_data["fd_z"] = np.gradient(imu_type_data["z"].values, edge_order=2)
+def imu_feature_extract(imu_df):
+    for axis in ["x", "y", "z"]:
+        imu_df[f"fft_{axis}"] = np.abs(np.fft.fft(imu_df[axis].values))
+        imu_df[f"fd_{axis}"]  = np.gradient(imu_df[axis].values, edge_order=2)
+        imu_df[f"sd_{axis}"]  = np.gradient(imu_df[f"fd_{axis}"].values, edge_order=2)
+    return imu_df
 
-    imu_type_data["sd_x"] = np.gradient(imu_type_data["fd_x"].values, edge_order=2)
-    imu_type_data["sd_y"] = np.gradient(imu_type_data["fd_y"].values, edge_order=2)
-    imu_type_data["sd_z"] = np.gradient(imu_type_data["fd_z"].values, edge_order=2)
 
-    return imu_type_data
+# ── IMU syncing ──────────────────────────────────────────────────────────────
 
-def scaling(dataframe):
-    std_scaler = StandardScaler()
-    columns_names = list(dataframe.columns)
-    dataframe = std_scaler.fit_transform(dataframe.to_numpy())
-    dataframe = pd.DataFrame(dataframe, columns=columns_names)
-    return dataframe
+def embed_zero_padding(sequence, target_length):
+    shortfall = target_length - len(sequence)
+    if shortfall <= 0:
+        return sequence
+    padding = pd.DataFrame(
+        np.zeros((shortfall, sequence.shape[1])),
+        columns=sequence.columns
+    )
+    return pd.concat([sequence, padding], ignore_index=True)
 
-def embed_zero_padding(sequence, sequence_length):
-    sample_count = sequence.shape[0]
-    missing_sample_count = sequence_length - sample_count
-    new_items_df = pd.DataFrame([[0] * sequence.shape[1] for i in range(missing_sample_count)], columns=list(sequence.columns))
-    sequence = pd.concat([sequence,new_items_df],axis=0)
-    sequence.reset_index(inplace = True, drop = True)
-    return sequence
 
-def sync_imu_data(accelerometer_data, gyroscope_data, magnetometer_data, sync_period, imu_sequence_length):
-    if (accelerometer_data.isnull().values.any()):
-        print("WARNING: Original accelerometer_data datframe contains NaN")
-        accelerometer_data.replace(np.nan, 0, inplace=True)
-    if (gyroscope_data.isnull().values.any()):
-        print("WARNING: Original gyroscope_data datframe contains NaN")
-        gyroscope_data.replace(np.nan, 0, inplace=True)
-    if (magnetometer_data.isnull().values.any()):
-        print("WARNING: Original magnetometer_data datframe contains NaN")
-        magnetometer_data.replace(np.nan, 0, inplace=True)
+def sync_imu_data(acc, gyr, mag, sync_period, imu_sequence_length):
+    for name, df in [("accelerometer", acc), ("gyroscope", gyr), ("magnetometer", mag)]:
+        if df.isnull().values.any():
+            print(f"WARNING: {name} dataframe contains NaN")
+            df.replace(np.nan, 0, inplace=True)
 
-    imu_prefixes = ["a", "g", "m"]
-    column_names = ["x", "y", "z", "fft_x", "fft_y", "fft_z", "fd_x", "fd_y", "fd_z", "sd_x", "sd_y", "sd_z"]
-    columns = []
-    for prefix in imu_prefixes:
-        for name in column_names:
-            columns.append(f"{prefix}_{name}")
+    def time_bounds(df):
+        if df.empty:
+            return math.inf, -math.inf
+        return df.iloc[0]["event_time"], df.iloc[-1]["event_time"]
 
-    imu_sequence = pd.DataFrame(columns=columns)
+    acc_min, acc_max = time_bounds(acc)
+    gyr_min, gyr_max = time_bounds(gyr)
+    mag_min, mag_max = time_bounds(mag)
 
-    # print("INFO: Sub IMU Data Length:", accelerometer_data.shape[0], gyroscope_data.shape[0], magnetometer_data.shape[0])
+    start_time = min(acc_min, gyr_min, mag_min)
+    highest_time = max(acc_max, gyr_max, mag_max)
 
-    accelerometer_min = math.inf
-    gyroscope_min = math.inf
-    magnetometer_min = math.inf
+    rows = []
+    t = start_time
+    while t < highest_time:
+        t_end = t + sync_period
+        slices = {
+            "a": acc.loc[(acc["event_time"] >= t) & (acc["event_time"] <= t_end)],
+            "g": gyr.loc[(gyr["event_time"] >= t) & (gyr["event_time"] <= t_end)],
+            "m": mag.loc[(mag["event_time"] >= t) & (mag["event_time"] <= t_end)],
+        }
+        if any(s.empty for s in slices.values()):
+            print("WARNING: Within sync period there are no elements")
 
-    if accelerometer_data.shape[0] != 0:
-        accelerometer_min = accelerometer_data.iloc[0]['event_time']
+        row = [
+            (slices[p][c].mean() or 0.0)   # NaN → 0.0
+            for p in IMU_PREFIXES
+            for c in IMU_COLUMNS
+        ]
+        rows.append(row)
+        t = t_end
 
-    if gyroscope_data.shape[0] != 0:
-        gyroscope_min = gyroscope_data.iloc[0]['event_time']
+    imu_sequence = pd.DataFrame(rows, columns=IMU_FULL_COLS)
 
-    if magnetometer_data.shape[0] != 0:
-        magnetometer_min = magnetometer_data.iloc[0]['event_time']
-  
-    lowest_time = min(accelerometer_min, gyroscope_min, magnetometer_min)
-
-    accelerometer_max = - math.inf
-    gyroscope_max = - math.inf
-    magnetometer_max = - math.inf
-
-    if accelerometer_data.shape[0] != 0:
-        accelerometer_max = accelerometer_data.iloc[accelerometer_data.shape[0] - 1]['event_time'] 
-
-    if gyroscope_data.shape[0] != 0:  
-        gyroscope_max = gyroscope_data.iloc[gyroscope_data.shape[0] - 1]['event_time']
-
-    if magnetometer_data.shape[0] != 0:
-        magnetometer_max = magnetometer_data.iloc[magnetometer_data.shape[0] - 1]['event_time']
-
-    highest_time = max(accelerometer_max, gyroscope_max, magnetometer_max)
-
-    start_time = lowest_time
-    end_time = start_time + sync_period
-
-    while start_time < highest_time:
-        relevant_accelerometer_data = accelerometer_data.loc[(accelerometer_data['event_time'] >= start_time) & (accelerometer_data['event_time'] <= end_time)]
-        relevant_gyroscope_data = gyroscope_data.loc[(gyroscope_data['event_time'] >= start_time) & (gyroscope_data['event_time'] <= end_time)]
-        relevant_magnetometer_data = magnetometer_data.loc[(magnetometer_data['event_time'] >= start_time) & (magnetometer_data['event_time'] <= end_time)]
-
-        if (relevant_accelerometer_data.shape[0] == 0 or relevant_gyroscope_data.shape[0] == 0 or relevant_magnetometer_data.shape[0] == 0):
-            print("WARNING: Within sync period there is no elements")
-
-        data = []
-        for prefix in imu_prefixes:
-            for name in column_names:
-                if (prefix == "a"):
-                    value = relevant_accelerometer_data[name].mean()
-                elif (prefix == "g"):
-                    value = relevant_gyroscope_data[name].mean()
-                else:
-                    value = relevant_magnetometer_data[name].mean()
-
-                if math.isnan(value):
-                    value = 0.0
-
-                data.append(value)
-
-        imu_sequence.loc[imu_sequence.shape[0]] = data
-
-        start_time = start_time + sync_period
-        end_time = end_time + sync_period
-
-    if(imu_sequence.shape[0] > imu_sequence_length):
+    if len(imu_sequence) > imu_sequence_length:
         imu_sequence = imu_sequence.head(imu_sequence_length)
-    elif (imu_sequence.shape[0] < imu_sequence_length):
+    else:
         imu_sequence = embed_zero_padding(imu_sequence, imu_sequence_length)
 
-    # print("INFO: IMU Sequence Length:", imu_sequence.shape[0])
     return imu_sequence
 
 
-def pre_process(event_data, event_sequence_length, imu_sequence_length, offset, accelerometer_data, gyroscope_data, magnetometer_data):
-    length = event_data.shape[0]
-    start = 0
-    end = start + event_sequence_length
+# ── Windowed pre-processing ──────────────────────────────────────────────────
+
+def pre_process(event_data, event_seq_len, imu_seq_len, offset, acc, gyr, mag):
+    # Slice keystroke windows
+    n = len(event_data)
     event_sequences = []
-    while start < length:
-        if end >= length:
-            event_sequences.append(event_data.loc[start: , :])
+    start = 0
+    while start < n:
+        end = start + event_seq_len
+        chunk = event_data.loc[start:, :] if end >= n else event_data.loc[start:end - 1, :]
+        event_sequences.append(chunk.reset_index(drop=True))
+        if end >= n:
             break
+        start += offset
 
-        sequence = event_data.loc[start:(end - 1), :]
-        sequence.reset_index(inplace = True, drop = True)
-        event_sequences.append(sequence) 
-        start = start + offset
-        end = start + event_sequence_length
-
+    # Align IMU windows to each keystroke window
     imu_sequences = []
+    for seq in event_sequences:
+        start_t = int(seq.iloc[0]["press_time"])
+        end_t   = int(seq.iloc[-1]["release_time"])
+        period  = (end_t - start_t) / imu_seq_len
 
-    max_imu_sample_count = -math.inf
-  
-    for sequence in event_sequences:
-        start_time = int(sequence.iloc[0]['press_time'])
-        end_time = int(sequence.iloc[-1]['release_time'])
-        
-        relevant_accelerometer_data = accelerometer_data.loc[(accelerometer_data['event_time'] >= start_time) & (accelerometer_data['event_time'] <= end_time)]
-        relevant_gyroscope_data = gyroscope_data.loc[(gyroscope_data['event_time'] >= start_time) & (gyroscope_data['event_time'] <= end_time)]
-        relevant_magnetometer_data = magnetometer_data.loc[(magnetometer_data['event_time'] >= start_time) & (magnetometer_data['event_time'] <= end_time)]
+        imu_sequences.append(sync_imu_data(
+            acc.loc[(acc["event_time"] >= start_t) & (acc["event_time"] <= end_t)],
+            gyr.loc[(gyr["event_time"] >= start_t) & (gyr["event_time"] <= end_t)],
+            mag.loc[(mag["event_time"] >= start_t) & (mag["event_time"] <= end_t)],
+            period, imu_seq_len,
+        ))
 
-        sync_period = (end_time - start_time) / imu_sequence_length
-
-        imu_sequence = sync_imu_data(relevant_accelerometer_data, relevant_gyroscope_data, relevant_magnetometer_data, sync_period, imu_sequence_length)
-
-        imu_sequences.append(imu_sequence)
-  
-    event_sequences[len(event_sequences) - 1] = embed_zero_padding(event_sequences[len(event_sequences) - 1], event_sequence_length)
-
+    event_sequences[-1] = embed_zero_padding(event_sequences[-1], event_seq_len)
     return event_sequences, imu_sequences
 
-def get_users(absolute_path):
-    DATASET_HOME_DIR = Path(absolute_path)
-    dataset_complete_path = DATASET_HOME_DIR / "public_dataset"
-    directory_list = os.listdir(dataset_complete_path)
 
-    def user_filter(directory):
-      return directory.isnumeric() and ("." not in directory)
-    
-    filtered = list(filter(user_filter, directory_list))
-    return filtered
+# ── Dataset reading ──────────────────────────────────────────────────────────
+
+def get_users(absolute_path):
+    public_dir = Path(absolute_path) / "public_dataset"
+    return [d for d in os.listdir(public_dir) if d.isnumeric() and "." not in d]
+
 
 def read_keystroke(absolute_path, users_list):
-    DATASET_HOME_DIR = Path(absolute_path)
-    dataset_complete_path = DATASET_HOME_DIR / "public_dataset"
+    public_dir = Path(absolute_path) / "public_dataset"
+    all_data = []
 
-    all_keystroke_data = []
-    user_count = 1
-    for userid in users_list:
+    for i, userid in enumerate(users_list, 1):
         session_data = []
-        for session in os.listdir(dataset_complete_path/f"{userid}"):
-            if ("." not in session):
-                keystroke_csv_data = pd.read_csv(dataset_complete_path/f"{userid}/{session}/KeyPressEvent.csv", header=None, usecols=[0, 3, 4], names=["event_time", "press_type", "key_code"])
-                if (keystroke_csv_data.shape[0] != 0):
-                    keystroke_csv_data["user_id"] = f"user_{userid}" 
-                    keystrokes = [keystroke_csv_data]
-                    generate_couple(keystrokes)
-                    keystroke_csv_data = keystrokes[0]
-                    keystroke_csv_data.drop(columns = ['user_id'], inplace=True)
-                    shrink_couple_data(keystroke_csv_data)
-                    accelerometer_csv_data = pd.read_csv(dataset_complete_path/f"{userid}/{session}/Accelerometer.csv", header=None, usecols=[0, 3, 4, 5], names=["event_time", "x", "y", "z"])
-                    gyroscope_csv_data = pd.read_csv(dataset_complete_path/f"{userid}/{session}/Gyroscope.csv", header=None, usecols=[0, 3, 4, 5], names=["event_time", "x", "y", "z"])
-                    magnetometer_csv_data = pd.read_csv(dataset_complete_path/f"{userid}/{session}/Magnetometer.csv", header=None, usecols=[0, 3, 4, 5], names=["event_time", "x", "y", "z"])
-                    
-                    keystroke_csv_data = keystroke_feature_extract(keystroke_csv_data)
-                    accelerometer_csv_data = imu_feature_extract(accelerometer_csv_data)
-                    gyroscope_csv_data = imu_feature_extract(gyroscope_csv_data)
-                    magnetometer_csv_data = imu_feature_extract(magnetometer_csv_data)
+        for session in os.listdir(public_dir / userid):
+            if "." in session:
+                continue
 
-                    keystroke_sequences, imu_sequences = pre_process(keystroke_csv_data, keystroke_sequence_len, imu_sequence_len, windowing_offset, accelerometer_csv_data, gyroscope_csv_data, magnetometer_csv_data)
-                    
-                    sequence_data = []
-                    for i in range(len(keystroke_sequences)):
-                        temp_keystroke = keystroke_sequences[i]
-                        temp_imu = imu_sequences[i]
-                        temp_keystroke = temp_keystroke.drop(columns=["press_time", "release_time", "key_code"])
-                        sequence_data.append([temp_keystroke.to_numpy(), temp_imu.to_numpy()])
+            session_dir = public_dir / userid / session
+            ks = pd.read_csv(session_dir / "KeyPressEvent.csv", header=None,
+                             usecols=[0, 3, 4], names=["event_time", "press_type", "key_code"])
+            if ks.empty:
+                continue
 
-                    session_data.append(sequence_data)
+            ks["user_id"] = f"user_{userid}"
+            generate_couple([ks])
+            ks.drop(columns=["user_id"], inplace=True)
+            ks = shrink_couple_data(ks)       # now returns instead of mutating
+            ks = keystroke_feature_extract(ks)
 
-                    print(f"INFO: Session {session} completed")
+            def read_imu(filename):
+                return imu_feature_extract(
+                    pd.read_csv(session_dir / filename, header=None,
+                                usecols=[0, 3, 4, 5], names=["event_time", "x", "y", "z"])
+                )
 
-        all_keystroke_data.append(session_data)
-        print(f"INFO: User {userid} completed ({user_count})")
-        user_count = user_count + 1
-                        
-                    
-    return all_keystroke_data
+            acc = read_imu("Accelerometer.csv")
+            gyr = read_imu("Gyroscope.csv")
+            mag = read_imu("Magnetometer.csv")
+
+            ks_seqs, imu_seqs = pre_process(ks, keystroke_sequence_len, imu_sequence_len,
+                                            windowing_offset, acc, gyr, mag)
+
+            sequences = [
+                [seq.drop(columns=["press_time", "release_time", "key_code"]).to_numpy(),
+                 imu.to_numpy()]
+                for seq, imu in zip(ks_seqs, imu_seqs)
+            ]
+            session_data.append(sequences)
+            print(f"INFO: Session {session} completed")
+
+        all_data.append(session_data)
+        print(f"INFO: User {userid} completed ({i}/{len(users_list)})")
+
+    return all_data
+
+
+# ── Pickle helpers ───────────────────────────────────────────────────────────
+
+def save_pickle(data, path):
+    with open(path, "wb") as f:
+        pickle.dump(data, f)
+
+
+# ── Entry point ──────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     config_data = Config().get_config_dict()["data"]
 
-    # Dataset download url (You can generate the link from this site: https://hmog-dataset.github.io/hmog/)
-    dataset_url = config_data["hmog"]["dataset_url"]
+    dataset_url           = config_data["hmog"]["dataset_url"]
+    keystroke_sequence_len = config_data["keystroke_sequence_len"] or 50
+    imu_sequence_len       = config_data["imu_sequence_len"]       or 100
+    windowing_offset       = config_data["hmog"]["windowing_offset"] or 5
 
-    keystroke_sequence_len = 50 if config_data["keystroke_sequence_len"] is None else config_data["keystroke_sequence_len"]
-    imu_sequence_len = 100 if config_data["imu_sequence_len"] is None else config_data["imu_sequence_len"]
-    windowing_offset = 5 if config_data["hmog"]["windowing_offset"] is None else config_data["hmog"]["windowing_offset"]
-
-    # If download_dataset is True then the dataset will be downloaded from the dataset_url
-    download_dataset = True
-
-    # Whether you want to extract the dataset
-    extract_dataset = True
-
-    # Whether you want to save the generated data files into google drive
-    save_in_google_drive = True
-    
-    if (download_dataset):
-        status = os.system(f"wget {dataset_url}")
-        if (status != 0):
-            print("Having an issue to download the dataset.")
-        else:
-            print("Download completed!")
-
-    if (extract_dataset):
-        extract("/content/download")
-
+    download_dataset_file(dataset_url)
+    extract(DOWNLOAD_FILE)
     get_filtered_users()
 
-    users_list = get_users("/content/dataset")
+    users_list = get_users(DATASET_DIR)
+    train_users, val_test = train_test_split(users_list, test_size=30, train_size=69, shuffle=True)
+    val_users, test_users = train_test_split(val_test,   test_size=15, train_size=15, shuffle=True)
 
-    training_user_list, val_test_user_list = train_test_split(users_list, test_size=30, train_size=69, shuffle=True)
-    validation_user_list, testing_user_list = train_test_split(val_test_user_list, test_size=15, train_size=15, shuffle=True)
-
-    training_keystroke_imu_data = read_keystroke("/content/dataset", training_user_list)
-    outfile = open(f"training_keystroke_imu_data_all.pickle",'wb')
-    pickle.dump(training_keystroke_imu_data, outfile)
-    outfile.close()
-    os.system(f"cp /content/training_keystroke_imu_data_all.pickle /content/drive/MyDrive/HMOG_Dataset/")
-
-    validation_keystroke_imu_data = read_keystroke("/content/dataset", validation_user_list)
-    outfile = open("validation_keystroke_imu_data_all.pickle",'wb')
-    pickle.dump(validation_keystroke_imu_data, outfile)
-    outfile.close()
-    os.system(f"cp /content/validation_keystroke_imu_data_all.pickle /content/drive/MyDrive/HMOG_Dataset/")
-
-    testing_keystroke_imu_data = read_keystroke("/content/dataset", testing_user_list)
-    outfile = open("testing_keystroke_imu_data_all.pickle",'wb')
-    pickle.dump(testing_keystroke_imu_data, outfile)
-    outfile.close()
-    os.system(f"cp /content/testing_keystroke_imu_data_all.pickle /content/drive/MyDrive/HMOG_Dataset/")
+    for split, users in [("training", train_users), ("validation", val_users), ("testing", test_users)]:
+        save_pickle(read_keystroke(DATASET_DIR, users), f"{split}_keystroke_imu_data_all.pickle")

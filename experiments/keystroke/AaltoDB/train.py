@@ -17,7 +17,7 @@ from metrics import Metric
 
 def preprocess():
     # Load dataset
-    data = pd.read_csv("keystroke_data.csv")
+    data = pd.read_csv("data/AaltoDB/prep_data/keystroke_data.csv")
 
     # Ensure whether dataset doesn't have any NaN values
     assert(data.isnull().values.any() == False)
@@ -47,15 +47,15 @@ def preprocess():
     del data_dict
 
     # Save testing dataset for further use
-    outfile = open("testing_data.pickle",'wb')
+    outfile = open("data/AaltoDB/prep_data/testing_data.pickle",'wb')
     pickle.dump(testing_data, outfile)
     outfile.close()
     # Save training dataset for further use
-    outfile = open("training_data.pickle",'wb')
+    outfile = open("data/AaltoDB/prep_data/training_data.pickle",'wb')
     pickle.dump(training_data, outfile)
     outfile.close()
     # Save validation dataset for further use
-    outfile = open("validation_data.pickle",'wb')
+    outfile = open("data/AaltoDB/prep_data/validation_data.pickle",'wb')
     pickle.dump(validation_data, outfile)
     outfile.close()
 
@@ -187,12 +187,12 @@ if __name__ == "__main__":
     preprocess()
 
     # Load training data
-    infile = open("training_data.pickle",'rb')
+    infile = open("data/AaltoDB/prep_data/training_data.pickle",'rb')
     training_data = pickle.load(infile)
     infile.close()
 
     # Load validation data
-    infile = open("validation_data.pickle",'rb')
+    infile = open("data/AaltoDB/prep_data/validation_data.pickle",'rb')
     validation_data = pickle.load(infile)
     infile.close()
 
