@@ -33,6 +33,6 @@ venv.bak/
 checkpoints
 best_models
 
-#data
-data/HMOGDB/prep_data/
+#Data
 data/AaltoDB/prep_data/
+data/HMOGDB/prep_data/
