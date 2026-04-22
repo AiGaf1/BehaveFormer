@@ -1,6 +1,7 @@
 import os
 import re
 import subprocess
+from importlib import import_module
 from pathlib import Path
 from typing import Iterable
 
@@ -14,7 +15,6 @@ _DATASET_HPARAMS = (
     "number_of_verify_sessions",
 )
 
-
 _EPOCH_RE = re.compile(
     r"Epoch No:\s*(?P<epoch>\d+)\s*-\s*Loss:\s*(?P<loss>[-+]?\d*\.?\d+)"
     r"\s*-\s*EER:\s*(?P<eer>[-+]?\d*\.?\d+)\s*-\s*Time:\s*(?P<time>[-+]?\d*\.?\d+)"
@@ -25,16 +25,12 @@ def load_env_file(env_path: Path | str = ".env") -> None:
     env_file = Path(env_path)
     if not env_file.exists():
         return
-
-    for raw_line in env_file.read_text().splitlines():
-        line = raw_line.strip()
+    for line in env_file.read_text().splitlines():
+        line = line.strip()
         if not line or line.startswith("#") or "=" not in line:
             continue
-
         key, value = line.split("=", 1)
-        key = key.strip()
-        value = value.strip().strip("'").strip('"')
-        os.environ.setdefault(key, value)
+        os.environ.setdefault(key.strip(), value.strip().strip("'\""))
 
 
 def build_run_name(args) -> str:
@@ -45,6 +41,7 @@ def build_config(args) -> dict:
     project_config = Config().get_config_dict()
     data_config = project_config["data"]
     hyperparams = project_config["hyperparams"]
+    resuming = args.mode == "continue_train" and args.initepoch
     checkpoint_dir = Path(args.script).resolve().parent / "checkpoints"
 
     config = {
@@ -61,30 +58,21 @@ def build_config(args) -> dict:
         "learning_rate": hyperparams["learning_rate"],
         "target_len": hyperparams["target_len"],
         "keystroke_sequence_len": data_config["keystroke_sequence_len"],
-        "resume_from_epoch": _maybe_int(args.initepoch) if args.mode == "continue_train" else None,
-        "resume_from_checkpoint_tar": (
-            str(checkpoint_dir / f"training_{args.initepoch}.tar")
-            if args.mode == "continue_train" and args.initepoch
-            else None
-        ),
-        "resume_from_checkpoint_ckpt": (
-            str(checkpoint_dir / f"training_{args.initepoch}.ckpt")
-            if args.mode == "continue_train" and args.initepoch
-            else None
-        ),
+        "resume_from_epoch": _maybe_int(args.initepoch) if resuming else None,
+        "resume_from_checkpoint_tar": str(checkpoint_dir / f"training_{args.initepoch}.tar") if resuming else None,
+        "resume_from_checkpoint_ckpt": str(checkpoint_dir / f"training_{args.initepoch}.ckpt") if resuming else None,
     }
 
     if args.dataset:
-        for name in _DATASET_HPARAMS:
-            config[name] = hyperparams[name].get(args.dataset)
-
+        config |= {name: hyperparams[name].get(args.dataset) for name in _DATASET_HPARAMS}
         dataset_config = data_config.get(args.dataset)
         if isinstance(dataset_config, dict):
             config["windowing_offset"] = dataset_config.get("windowing_offset")
 
     if args.imu:
+        imu_key = "all" if args.imu == "all" else ("two_types" if "_" in args.imu else "one_type")
         config["imu_sequence_len"] = data_config["imu_sequence_len"]
-        config["imu_feature_count"] = _imu_feature_count(hyperparams, args.imu)
+        config["imu_feature_count"] = hyperparams["imu_feature_count"][imu_key]
 
     return {k: v for k, v in config.items() if v is not None}
 
@@ -99,12 +87,8 @@ def init_run(
 ):
     if not enabled:
         return None
-
     load_env_file()
-
-    import wandb
-
-    return wandb.init(
+    return import_module("wandb").init(
         project=project,
         entity=entity,
         config=config,
@@ -125,24 +109,14 @@ def stream_subprocess(
         return subprocess.Popen(command, cwd=cwd, env=env).wait()
 
     process = subprocess.Popen(
-        command,
-        cwd=cwd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        bufsize=1,
-        env=env,
+        command, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, env=env,
     )
-
-    assert process.stdout is not None
-    for line in process.stdout:
+    for line in process.stdout or []:
         print(line, end="")
-        if run is None:
-            continue
-
-        metrics = parse_metrics(line)
-        if metrics is not None:
-            run.log(metrics, step=metrics["epoch"])
+        if run is not None:
+            metrics = parse_metrics(line)
+            if metrics:
+                run.log(metrics, step=metrics["epoch"])
 
     return process.wait()
 
@@ -151,7 +125,6 @@ def parse_metrics(line: str) -> dict | None:
     match = _EPOCH_RE.search(line)
     if not match:
         return None
-
     return {
         "epoch": int(match.group("epoch")),
         "train/loss": float(match.group("loss")),
@@ -161,17 +134,7 @@ def parse_metrics(line: str) -> dict | None:
 
 
 def _maybe_int(value: str | None) -> int | None:
-    if value is None:
-        return None
     try:
-        return int(value)
+        return int(value) if value is not None else None
     except ValueError:
         return None
-
-
-def _imu_feature_count(hyperparams: dict, imu_mode: str) -> int:
-    if imu_mode == "all":
-        return hyperparams["imu_feature_count"]["all"]
-    if "_" in imu_mode:
-        return hyperparams["imu_feature_count"]["two_types"]
-    return hyperparams["imu_feature_count"]["one_type"]
