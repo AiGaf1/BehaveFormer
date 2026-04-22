@@ -18,7 +18,6 @@ sys.path.append(str(Path(__file__).resolve().parents[3] / "utils"))
 sys.path.append(str(Path(__file__).resolve().parents[3] / "evaluation"))
 from Config import Config
 from metrics import Metric
-from model import KeystrokeTransformer
 
 # ── Plot defaults ────────────────────────────────────────────────────────────
 
@@ -95,7 +94,6 @@ def extract_normalize_features(dataset):
     """Vectorised: no Python loop over rows."""
     for user_sequences in dataset:
         for idx, seq in enumerate(user_sequences):
-            n = len(seq)
             press   = seq[:, 0]
             release = seq[:, 1]
             keys    = seq[:, 2]
@@ -137,7 +135,6 @@ def _scores_all(feature_embeddings, num_enroll):
     Returns a list of score tensors, one per user.
     """
     n_users, n_sessions, emb_dim = feature_embeddings.shape
-    n_verify = n_sessions - num_enroll
 
     enroll = feature_embeddings[:, :num_enroll]           # (U, E, D)
     verify = feature_embeddings[:, num_enroll:]           # (U, V, D)
@@ -226,15 +223,19 @@ def save_DET_curve(feature_embeddings, num_enroll_sessions):
     fix_eer_pos   = max(eer_positions)
     max_ele_count = fix_eer_pos - min(eer_positions)
 
-    values = div = 0
+    values = None
+    div = None
     for i, scores in enumerate(all_scores):
         far_frrs = _get_far_frr(scores[:n_verify], scores[n_verify:],
                                 _min, _max, fix_eer_pos, max_ele_count, eer_positions[i])
-        if isinstance(values, int):
+        if values is None or div is None:
             values, div = far_frrs
         else:
             values += far_frrs[0]
             div    += far_frrs[1]
+
+    if values is None or div is None:
+        return
 
     pd.DataFrame(values / div, columns=["FAR", "FRR"]).to_csv(RESULTS_PATH / "far-frr.csv")
 
@@ -273,19 +274,6 @@ def _eer_index(scores_g, scores_i, ini, fin):
     return int(np.argmin(gap))
 
 
-def _get_far_frr(scores_g, scores_i, ini, fin, fix_eer_pos, max_ele_count, eer_pos):
-    far_frr = [
-        [torch.count_nonzero(scores_i >= t).item() / len(scores_i),
-         torch.count_nonzero(scores_g <  t).item() / len(scores_g)]
-        for t in _threshold_range(ini, fin)
-    ]
-    adding_count = fix_eer_pos - eer_pos
-    front_pad    = [[0.0, 0.0]] * adding_count
-    if adding_count:
-        far_frr = front_pad + far_frr[:-adding_count]
-    back_pad = [[1.0, 1.0]] * (len(far_frr) - adding_count)
-    return np.array(far_frr), np.array(front_pad + back_pad)
-
 
 # ── t-SNE / PCA plot ─────────────────────────────────────────────────────────
 
@@ -306,12 +294,11 @@ def save_PCA_curve(feature_embeddings, num_enroll_sessions, number_of_users):
     COLORS = ["red","green","blue","black","blueviolet",
               "orange","grey","brown","deeppink","purple"]
     g = sns.relplot(data=df, x="t-SNE Dimension 1", y="t-SNE Dimension 2",
-                    hue="Users", sizes=(10, 200), palette=COLORS)
+                    hue="Users", sizes=(10, 200), palette=COLORS, legend=False)
     g.set(xscale="linear", yscale="linear")
     g.ax.xaxis.grid(True, "minor", linewidth=0.25)
     g.ax.yaxis.grid(True, "minor", linewidth=0.25)
     g.despine(left=True, bottom=True)
-    g._legend.remove()
     plt.savefig(RESULTS_PATH / "pca_graph.png", dpi=400)
 
 

@@ -5,19 +5,24 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-import torch
+from Config import Config
+from metrics import Metric
+from model import KeystrokeTransformer
 from torch.utils.data import Dataset
+
+from experiments.keystroke.common.lightning import run_keystroke_training
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 HERE = Path(__file__).resolve().parent
+
+for path in ["utils", "evaluation", ""]:
+    sys.path.append(str(PROJECT_ROOT / path))
+
+
 DATA_DIR = PROJECT_ROOT / "data" / "AaltoDB" / "prep_data"
 BEST_MODELS_DIR = HERE / "best_models"
-CHECKPOINTS_DIR = HERE / "checkpoints"
 
 CSV_PATH = DATA_DIR / "keystroke_data.csv"
-TRAINING_PICKLE = DATA_DIR / "training_data.pickle"
-VALIDATION_PICKLE = DATA_DIR / "validation_data.pickle"
-TESTING_PICKLE = DATA_DIR / "testing_data.pickle"
 TRAINING_FEATURES_PICKLE = DATA_DIR / "training_features.pickle"
 VALIDATION_FEATURES_PICKLE = DATA_DIR / "validation_features.pickle"
 
@@ -28,38 +33,11 @@ VERIFY_SESSIONS = 5
 for path in ["utils", "evaluation", ""]:
     sys.path.append(str(PROJECT_ROOT / path))
 
-from Config import Config
-from metrics import Metric
-from model import KeystrokeTransformer
-from experiments.keystroke.common.lightning import (
-    KeystrokeDataModule,
-    KeystrokeLightningModule,
-    TrainingArtifactsCallback,
-    build_trainer,
-    configure_lightning_environment,
-    load_resume_state,
-    recommended_num_workers,
-    setup_wandb,
-)
-
-
-def _save_pickle(path, obj):
-    with open(path, "wb") as file:
-        pickle.dump(obj, file)
-
-
-def _load_pickle(path):
-    with open(path, "rb") as file:
-        return pickle.load(file)
-
 
 def _pad_sequence(sequence, seq_len):
-    if len(sequence) == seq_len:
-        return sequence
-    if len(sequence) < seq_len:
-        padding = np.zeros((seq_len - len(sequence), sequence.shape[1]))
-        return np.vstack([sequence, padding])
-    return sequence[:seq_len]
+    out = np.zeros((seq_len, sequence.shape[1]))
+    out[:len(sequence)] = sequence[:seq_len]
+    return out
 
 
 def _compute_features(sequence):
@@ -83,7 +61,17 @@ def _compute_features(sequence):
     return features
 
 
-def preprocess():
+def _load_data():
+
+    def _load_pickle(path):
+        with open(path, "rb") as file:
+            return pickle.load(file)
+    
+    if TRAINING_FEATURES_PICKLE.exists() and VALIDATION_FEATURES_PICKLE.exists():
+        print("Using cached Aalto feature pickles")
+        return _load_pickle(TRAINING_FEATURES_PICKLE), _load_pickle(VALIDATION_FEATURES_PICKLE)
+
+    print("Building Aalto feature pickles")
     data = pd.read_csv(CSV_PATH)
     assert not data.isnull().values.any()
     data_dict = {
@@ -92,33 +80,17 @@ def preprocess():
     }
     all_users = [sessions for sessions in data_dict.values() if len(sessions) == SESSIONS_PER_USER]
     print(f"Users after filtering: {len(all_users)}")
-    for pickle_path, split in zip(
-        [TRAINING_PICKLE, VALIDATION_PICKLE, TESTING_PICKLE],
-        [all_users[:-1050], all_users[-1050:-1000], all_users[-1000:]],
-    ):
-        _save_pickle(pickle_path, split)
-
-
-def _ensure_preprocessed_pickles():
-    if all(path.exists() for path in [TRAINING_PICKLE, VALIDATION_PICKLE, TESTING_PICKLE]):
-        print("Using cached Aalto split pickles")
-        return
-    print("Building Aalto split pickles")
-    preprocess()
-
-
-def _load_feature_pickles():
-    if TRAINING_FEATURES_PICKLE.exists() and VALIDATION_FEATURES_PICKLE.exists():
-        print("Using cached Aalto feature pickles")
-        return _load_pickle(TRAINING_FEATURES_PICKLE), _load_pickle(VALIDATION_FEATURES_PICKLE)
-
-    print("Building Aalto feature pickles")
-    training_data = _load_pickle(TRAINING_PICKLE)
-    validation_data = _load_pickle(VALIDATION_PICKLE)
+    training_data = all_users[:-1050]
+    validation_data = all_users[-1050:-1000]
     for dataset in (training_data, validation_data):
         for user_sequences in dataset:
             for index, sequence in enumerate(user_sequences):
                 user_sequences[index] = _compute_features(sequence)
+
+    def _save_pickle(path, obj):
+        with open(path, "wb") as file:
+            pickle.dump(obj, file)
+                      
     _save_pickle(TRAINING_FEATURES_PICKLE, training_data)
     _save_pickle(VALIDATION_FEATURES_PICKLE, validation_data)
     return training_data, validation_data
@@ -165,15 +137,12 @@ def _make_model(feature_count, seq_len, target_len):
 
 
 if __name__ == "__main__":
-    configure_lightning_environment()
-
     config = Config().get_config_dict()
     gdown_id = config["preprocessed_data"]["aalto"]["keystroke"]
     if gdown_id and not CSV_PATH.exists():
         subprocess.run(f"gdown {gdown_id}", shell=True)
 
-    _ensure_preprocessed_pickles()
-    training_data, validation_data = _load_feature_pickles()
+    training_data, validation_data = _load_data()
 
     hyperparams = config["hyperparams"]
     data_config = config["data"]
@@ -184,52 +153,19 @@ if __name__ == "__main__":
     target_len = hyperparams["target_len"]
     learning_rate = hyperparams["learning_rate"]
 
-    BEST_MODELS_DIR.mkdir(exist_ok=True)
-    CHECKPOINTS_DIR.mkdir(exist_ok=True)
-
     epochs = int(sys.argv[1])
-    epoch_offset = int(sys.argv[2]) if len(sys.argv) > 2 else 0
-    best_eer, model_state, optimizer_state = load_resume_state(CHECKPOINTS_DIR, epoch_offset)
-
-    use_gpu = config["GPU"] == "True" and torch.cuda.is_available()
-    if use_gpu:
-        torch.set_float32_matmul_precision("high")
-
-    module = KeystrokeLightningModule(
-        model_factory=lambda: _make_model(feature_count, seq_len, target_len),
+    run_keystroke_training(
+        project_root=PROJECT_ROOT,
+        best_model_dir=BEST_MODELS_DIR,
+        train_dataset=TrainDataset(training_data, batch_size, epoch_batch_count, seq_len),
+        val_dataset=TestDataset(validation_data, seq_len),
+        batch_size=batch_size,
         learning_rate=learning_rate,
+        epochs=epochs,
+        model_factory=lambda: _make_model(feature_count, seq_len, target_len),
         compute_val_eer=lambda embeddings: Metric.cal_user_eer_aalto(
             embeddings.view(len(validation_data), SESSIONS_PER_USER, target_len),
             ENROLL_SESSIONS,
             VERIFY_SESSIONS,
         )[0],
-    )
-    if model_state is not None:
-        module.model.load_state_dict(model_state)
-        module.resume_optimizer_state = optimizer_state
-
-    wandb_logger = setup_wandb(PROJECT_ROOT, module.model)
-    trainer = build_trainer(
-        use_gpu,
-        epochs,
-        TrainingArtifactsCallback(
-            BEST_MODELS_DIR,
-            CHECKPOINTS_DIR,
-            dataset_name="aalto",
-            epoch_offset=epoch_offset,
-            best_eer=best_eer,
-            wandb_logger=wandb_logger,
-            resume_from_epoch=epoch_offset or None,
-        ),
-        wandb_logger,
-    )
-    trainer.fit(
-        module,
-        datamodule=KeystrokeDataModule(
-            TrainDataset(training_data, batch_size, epoch_batch_count, seq_len),
-            TestDataset(validation_data, seq_len),
-            batch_size=batch_size,
-            num_workers=recommended_num_workers(),
-            pin_memory=use_gpu,
-        ),
     )

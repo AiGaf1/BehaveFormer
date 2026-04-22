@@ -3,14 +3,13 @@ import os
 import pickle
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import StandardScaler
 
-import sys
 sys.path.append(str(Path(__file__).resolve().parents[2] / "utils"))
 from Config import Config
 
