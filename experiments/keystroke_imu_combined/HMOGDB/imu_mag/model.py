@@ -8,14 +8,9 @@ class PositionalEncoding(nn.Module):
         self.embedding = nn.Parameter(torch.zeros([k, d_model], dtype=torch.float), requires_grad=True)
         nn.init.xavier_uniform_(self.embedding, gain=1)
         self.positions = torch.tensor([i for i in range(seq_len)], requires_grad=False).unsqueeze(1).repeat(1, k)
-        s = 0.0
         interval = seq_len / k
-        mu = []
-        for _ in range(k):
-            mu.append(nn.Parameter(torch.tensor(s, dtype=torch.float), requires_grad=True))
-            s = s + interval
-        self.mu = nn.Parameter(torch.tensor(mu, dtype=torch.float).unsqueeze(0), requires_grad=True)
-        self.sigma = nn.Parameter(torch.tensor([torch.tensor([50.0], dtype=torch.float, requires_grad=True) for _ in range(k)]).unsqueeze(0))
+        self.mu = nn.Parameter((torch.arange(k, dtype=torch.float) * interval).unsqueeze(0))
+        self.sigma = nn.Parameter(torch.full((1, k), 50.0))
         
     def normal_pdf(self, pos, mu, sigma):
         a = pos - mu

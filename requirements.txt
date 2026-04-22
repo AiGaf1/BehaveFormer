@@ -13,4 +13,6 @@ pathlib==1.0.1
 numpy==1.23.5
 matplotlib==3.7.1
 gdown==4.6.6
+wandb==0.19.11
+pytorch-lightning==2.6.1
 

@@ -36,3 +36,4 @@ best_models
 #Data
 data/AaltoDB/prep_data/
 data/HMOGDB/prep_data/
+wandb/
