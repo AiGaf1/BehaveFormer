@@ -1,14 +1,20 @@
 {
+    "python.defaultInterpreterPath": "${workspaceFolder}/.venv/bin/python",
+    "python.terminal.activateEnvironment": true,
     "python-envs.defaultEnvManager": "ms-python.python:system",
+    "ruff.configurationPreference": "filesystemFirst",
+    "ruff.nativeServer": "on",
     "files.exclude": {
-    "**/__pycache__": true,
-    "**/*.pyc": true,
-    "**/.venv": true,
-    "**/.git": true,
-    "**/LICENSE": true,
-    "**/*.egg-info": true,
-    "**/wandb": true,
-    ".codex": true,
-    ".env": true,
-  }
+        "**/__pycache__": true,
+        "**/*.pyc": true,
+        "**/.venv": true,
+        "**/.git": true,
+        "**/LICENSE": true,
+        "**/*.egg-info": true,
+        "**/wandb": true,
+        ".codex": true,
+        ".env": true,
+        "experiments/keystroke/HuMIdb": true,
+        "**/.ruff_cache": true
+    }
 }

@@ -1,0 +1,65 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "Keystroke-Continuous-Authentication"
+version = "0.1.0"
+description = "Research code for keystroke continuous authentication with multi-scale temporal encoding."
+readme = "README.md"
+requires-python = ">=3.12"
+authors = [
+    { name = "Aidar Gaffarov", email = "aidar.gaffaroff@gmail.com" },
+]
+dependencies = [
+    "colorama==0.4.6",
+    "matplotlib==3.10.8",
+    "numpy==2.4.4",
+    "onnx==1.21.0",
+    "plotly==6.7.0",
+    "pytorch-lightning==2.6.1",
+    "pytorch-metric-learning==2.9.0",
+    "python-dotenv==1.2.2",
+    "scikit-learn==1.8.0",
+    "scipy==1.17.1",
+    "seaborn==0.13.2",
+    "torch==2.11.0",
+    "wandb==0.25.1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "black==26.3.1",
+    "pylint>=4.0.5",
+    "ruff==0.15.10",
+]
+
+[tool.setuptools]
+packages = []
+py-modules = []
+
+[tool.black]
+line-length = 150
+target-version = ["py312"]
+extend-exclude = '''
+^/(data/Aalto/raw|outputs)
+'''
+
+[tool.ruff]
+target-version = "py312"
+line-length = 150
+extend-exclude = [
+    "data/Aalto/raw",
+    "outputs",
+]
+
+[tool.ruff.lint]
+select = ["E", "F", "I"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["config", "data", "models", "utils"]
+
+[tool.pyright]
+venvPath = "."
+venv = ".venv"
+extraPaths = [".", "evaluation", "utils"]
