@@ -71,13 +71,16 @@ def resolve_script(args):
     return experiment_dir / f"{script}.py"
 
 
-def use_native_wandb(args) -> bool:
+def use_native_lightning(args) -> bool:
     return (
-        args.wandb
-        and args.model == "keystroke"
-        and args.dataset == "aalto"
+        args.model == "keystroke"
+        and args.dataset in {"aalto", "hmog", "humi"}
         and args.mode in {"train", "continue_train"}
     )
+
+
+def use_native_wandb(args) -> bool:
+    return args.wandb and use_native_lightning(args)
 
 
 def subprocess_env_for_native_wandb(args, config: dict, tags: list[str]) -> dict:
@@ -112,6 +115,7 @@ if __name__ == "__main__":
 
     run = None
     subprocess_env = None
+    native_lightning = use_native_lightning(args)
     if use_native_wandb(args):
         subprocess_env = subprocess_env_for_native_wandb(args, config, tags)
     else:
@@ -124,7 +128,13 @@ if __name__ == "__main__":
             tags=tags,
         )
 
-    exit_code = stream_subprocess(command, cwd=ROOT, run=run, env=subprocess_env)
+    exit_code = stream_subprocess(
+        command,
+        cwd=ROOT,
+        run=run,
+        env=subprocess_env,
+        passthrough_output=native_lightning,
+    )
     if run is not None:
         run.finish()
 

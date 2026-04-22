@@ -6,6 +6,9 @@
     "**/.venv": true,
     "**/.git": true,
     "**/LICENSE": true,
-    "**/*.egg-info": true
+    "**/*.egg-info": true,
+    "**/wandb": true,
+    ".codex": true,
+    ".env": true,
   }
 }

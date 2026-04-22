@@ -17,6 +17,26 @@ import matplotlib as mpl
 import matplotlib.pyplot as plt
 from sklearn.manifold import TSNE
 
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
+PREP_DATA_DIR = PROJECT_ROOT / "data" / "HMOGDB" / "prep_data"
+TESTING_PICKLE = "testing_keystroke_imu_data_all.pickle"
+
+
+def _pickle_path(name):
+    prep_path = PREP_DATA_DIR / name
+    root_path = PROJECT_ROOT / name
+    if prep_path.exists():
+        return prep_path
+    if root_path.exists():
+        return root_path
+    return prep_path
+
+
+def _maybe_download(file_id, target_path):
+    if target_path.exists() or not file_id:
+        return
+    subprocess.run(f"gdown {file_id}", shell=True, check=True, cwd=target_path.parent)
+
 plt.style.use('seaborn-v0_8-bright')
 plt.rcParams['axes.facecolor'] = 'white'
 mpl.rcParams.update({"axes.grid" : True, "grid.color": "black"})
@@ -27,24 +47,30 @@ def scale(data):
     for user in data:
         for session in user:
             for i in range(len(session)):
+                keystroke = session[i][0].astype(np.float64, copy=True)
+                imu = session[i][1].astype(np.float64, copy=True)
+
                 # Keystroke scaling
                 for j in range(10):
                     if (j == 9):
                         # hold latency, key code
-                        session[i][0][:, j] = session[i][0][:, j] / 255
+                        keystroke[:, j] = keystroke[:, j] / 255
                     else:
-                        session[i][0][:, j] = session[i][0][:, j] / 1000
+                        keystroke[:, j] = keystroke[:, j] / 1000
                         
                 # IMU scaling
                 for j in range(36):
                     if (j == 0 or j == 1 or j == 2):
-                        session[i][1][:, j] = session[i][1][:, j] / 10
+                        imu[:, j] = imu[:, j] / 10
                     elif (j == 3 or j == 4 or j == 5 or j == 15 or j == 16 or j == 17):
-                        session[i][1][:, j] = session[i][1][:, j] / 1000
+                        imu[:, j] = imu[:, j] / 1000
                     elif (j == 24 or j == 25 or j == 26):
-                        session[i][1][:, j] = session[i][1][:, j] / 100
+                        imu[:, j] = imu[:, j] / 100
                     elif (j == 27 or j == 28 or j == 29):
-                        session[i][1][:, j] = session[i][1][:, j] / 10000
+                        imu[:, j] = imu[:, j] / 10000
+
+                session[i][0] = keystroke
+                session[i][1] = imu
 
         
 # Dataset for validating/testing the model
@@ -116,12 +142,13 @@ if __name__ == "__main__":
 
     test_id = config.get_config_dict()["preprocessed_data"]["hmog"]["test"]
 
-    subprocess.run(f"gdown {test_id}", shell=True)
+    testing_path = _pickle_path(TESTING_PICKLE)
+    _maybe_download(test_id, testing_path)
 
     if(config.get_config_dict()["GPU"]== "True"):
         torch.set_default_tensor_type('torch.cuda.FloatTensor')
 
-    infile = open("testing_keystroke_imu_data_all.pickle",'rb')
+    infile = open(testing_path,'rb')
     testing_data = pickle.load(infile)
     infile.close()
     

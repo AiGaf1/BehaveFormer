@@ -18,6 +18,26 @@ sys.path.append(str((Path(__file__)/"../../../../evaluation").resolve()))
 from Config import Config
 from metrics import Metric
 
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
+PREP_DATA_DIR = PROJECT_ROOT / "data" / "HuMIdb" / "prep_data"
+TESTING_PICKLE = "testing_keystroke_imu_data_all.pickle"
+
+
+def _pickle_path(name):
+    prep_path = PREP_DATA_DIR / name
+    root_path = PROJECT_ROOT / name
+    if prep_path.exists():
+        return prep_path
+    if root_path.exists():
+        return root_path
+    return prep_path
+
+
+def _maybe_download(file_id, target_path):
+    if target_path.exists() or not file_id:
+        return
+    subprocess.run(f"gdown {file_id}", shell=True, check=True, cwd=target_path.parent)
+
 def convert_to_float(data):
     for user in data:
         for ses in user:
@@ -32,21 +52,27 @@ def scale(data):
     for user in data:
         for session in user:
             for i in range(len(session)):
+                keystroke = session[i][0].astype(np.float64, copy=True)
+                imu = session[i][1].astype(np.float64, copy=True)
+
                 # Keystroke scaling
                 for j in range(4):
                     if (j == 3):
-                        session[i][0][:, j] = session[i][0][:, j] / 255
+                        keystroke[:, j] = keystroke[:, j] / 255
                     elif (j in [1,2]):
-                        session[i][0][:, j] = session[i][0][:, j] / 1000
+                        keystroke[:, j] = keystroke[:, j] / 1000
                         
                 # IMU scaling
                 for j in range(36):
                     if (j in [0,1,2]):
-                        session[i][1][:, j] = session[i][1][:, j] / 10
+                        imu[:, j] = imu[:, j] / 10
                     elif (j in [3,4,5,24,25,26,27,28,29]):
-                        session[i][1][:, j] = session[i][1][:, j] / 1000
+                        imu[:, j] = imu[:, j] / 1000
                     elif (j in [15,16,17]):
-                        session[i][1][:, j] = session[i][1][:, j] / 100
+                        imu[:, j] = imu[:, j] / 100
+
+                session[i][0] = keystroke
+                session[i][1] = imu
 
 
 # Dataset for validating/testing the model
@@ -119,12 +145,13 @@ if __name__ == "__main__":
     config_data = Config().get_config_dict()
     preprocessed_data = config_data['preprocessed_data']
     
-    subprocess.run(f'gdown {preprocessed_data["humi"]["test"]}', shell=True)
+    testing_path = _pickle_path(TESTING_PICKLE)
+    _maybe_download(preprocessed_data["humi"]["test"], testing_path)
 
     if(config_data["GPU"] == "True"):
         torch.set_default_tensor_type('torch.cuda.FloatTensor')
 
-    infile = open("testing_keystroke_imu_data_all.pickle",'rb')
+    infile = open(testing_path,'rb')
     testing_data = pickle.load(infile)
     infile.close()
 

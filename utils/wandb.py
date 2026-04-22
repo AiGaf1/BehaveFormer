@@ -114,7 +114,16 @@ def init_run(
     )
 
 
-def stream_subprocess(command: list[str], cwd: Path, run=None, env: dict | None = None) -> int:
+def stream_subprocess(
+    command: list[str],
+    cwd: Path,
+    run=None,
+    env: dict | None = None,
+    passthrough_output: bool = False,
+) -> int:
+    if passthrough_output:
+        return subprocess.Popen(command, cwd=cwd, env=env).wait()
+
     process = subprocess.Popen(
         command,
         cwd=cwd,

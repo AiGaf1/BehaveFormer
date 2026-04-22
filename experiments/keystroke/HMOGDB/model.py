@@ -7,7 +7,7 @@ class PositionalEncoding(nn.Module):
         
         self.embedding = nn.Parameter(torch.zeros([k, d_model], dtype=torch.float), requires_grad=True)
         nn.init.xavier_uniform_(self.embedding, gain=1)
-        self.positions = torch.tensor([i for i in range(seq_len)], requires_grad=False).unsqueeze(1).repeat(1, k)
+        self.register_buffer("positions", torch.arange(seq_len).unsqueeze(1).repeat(1, k))
         interval = seq_len / k
         self.mu = nn.Parameter((torch.arange(k, dtype=torch.float) * interval).unsqueeze(0))
         self.sigma = nn.Parameter(torch.full((1, k), 50.0))
