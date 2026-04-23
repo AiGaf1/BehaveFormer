@@ -8,11 +8,21 @@ from pytorch_lightning.callbacks import ModelCheckpoint
 from pytorch_lightning.loggers import WandbLogger
 from torch.utils.data import DataLoader
 
-from experiments.keystroke.common.loss import TripletLoss
+from experiments.common.loss import TripletLoss
 
 
 class _KeystrokeLightningModule(pl.LightningModule):
-    def __init__(self, model_factory, learning_rate: float, compute_val_eer, loss_fn=None):
+    def __init__(
+        self,
+        model_factory,
+        learning_rate: float,
+        compute_val_eer,
+        loss_fn=None,
+        compute_val_metrics=None,
+        compute_train_metrics=None,
+        train_eval_loader=None,
+        metrics_every_n_epochs: int = 5,
+    ):
         super().__init__()
         self.model_factory = model_factory
         self.compute_val_eer = compute_val_eer
@@ -20,6 +30,10 @@ class _KeystrokeLightningModule(pl.LightningModule):
         self.model = model_factory()
         self.loss_fn = loss_fn if loss_fn is not None else TripletLoss()
         self.validation_embeddings = []
+        self.compute_val_metrics = compute_val_metrics
+        self.compute_train_metrics = compute_train_metrics
+        self.train_eval_loader = train_eval_loader
+        self.metrics_every_n_epochs = metrics_every_n_epochs
 
     def training_step(self, batch, _):
         anchor, positive, negative = batch
@@ -36,8 +50,34 @@ class _KeystrokeLightningModule(pl.LightningModule):
     def on_validation_epoch_end(self):
         if not self.validation_embeddings:
             return
-        eer = self.compute_val_eer(torch.cat(self.validation_embeddings, dim=0))
+
+        val_embeddings = torch.cat(self.validation_embeddings, dim=0)
+        eer = self.compute_val_eer(val_embeddings)
         self.log("val_eer", eer, on_step=False, on_epoch=True, prog_bar=True, logger=True)
+
+        epoch = self.current_epoch + 1
+        if epoch % self.metrics_every_n_epochs != 0:
+            return
+
+        if self.compute_val_metrics is not None:
+            val_metrics = self.compute_val_metrics(val_embeddings)
+            self.log_dict(
+                {f"val_{k}": v for k, v in val_metrics.items() if k != "eer"},
+                on_epoch=True,
+                logger=True,
+            )
+
+        if self.compute_train_metrics is not None and self.train_eval_loader is not None:
+            train_embeddings = self._collect_embeddings(self.train_eval_loader)
+            train_metrics = self.compute_train_metrics(train_embeddings)
+            self.log_dict({f"train_{k}": v for k, v in train_metrics.items()}, on_epoch=True, logger=True)
+
+    @torch.no_grad()
+    def _collect_embeddings(self, loader):
+        self.model.eval()
+        embeddings = [self.model(batch.float().to(self.device)).detach() for batch in loader]
+        self.model.train()
+        return torch.cat(embeddings, dim=0)
 
     def configure_optimizers(self):
         return torch.optim.AdamW(self.model.parameters(), lr=self.learning_rate)
@@ -87,14 +127,15 @@ def run_keystroke_training(
     model_factory,
     compute_val_eer,
     loss_fn=None,
+    compute_val_metrics=None,
+    compute_train_metrics=None,
+    train_eval_dataset=None,
+    metrics_every_n_epochs: int = 5,
 ):
     best_model_dir = Path(best_model_dir)
     best_model_dir.mkdir(exist_ok=True)
 
     torch.set_float32_matmul_precision("high")
-
-    module = _KeystrokeLightningModule(model_factory, learning_rate, compute_val_eer, loss_fn=loss_fn)
-    wandb_logger = _setup_wandb(project_root, module.model)
 
     num_workers = max(1, min(8, (os.cpu_count() or 1) - 1))
     loader_kwargs = {
@@ -105,6 +146,24 @@ def run_keystroke_training(
     }
     train_loader = DataLoader(train_dataset, **loader_kwargs)
     val_loader = DataLoader(val_dataset, **loader_kwargs)
+
+    train_eval_loader = (
+        DataLoader(train_eval_dataset, **loader_kwargs)
+        if train_eval_dataset is not None
+        else None
+    )
+
+    module = _KeystrokeLightningModule(
+        model_factory,
+        learning_rate,
+        compute_val_eer,
+        loss_fn=loss_fn,
+        compute_val_metrics=compute_val_metrics,
+        compute_train_metrics=compute_train_metrics,
+        train_eval_loader=train_eval_loader,
+        metrics_every_n_epochs=metrics_every_n_epochs,
+    )
+    wandb_logger = _setup_wandb(project_root, module.model)
 
     best_ckpt = ModelCheckpoint(
         dirpath=str(best_model_dir),

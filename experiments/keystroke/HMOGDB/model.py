@@ -1,7 +1,7 @@
 import torch
 from torch import nn
 
-from experiments.keystroke.common.modeling import PositionalEncoding, TransformerEncoder, build_projection_head
+from experiments.common.modeling import PositionalEncoding, TransformerEncoder, build_projection_head
 
 
 class Transformer(nn.Module):

@@ -18,6 +18,9 @@ HMOG_SPEC = NestedKeystrokeDatasetSpec(
     dataset_key="hmog",
     dataset_dir_name="HMOGDB",
     validation_sequences_per_session=50,
+    compute_periodic_metrics=True,
+    train_metrics_subset_users=256,
+    metrics_every_n_epochs=5,
     keystroke_scale_map={index: (255 if index == 9 else 1000) for index in range(10)},
     imu_scale_map={
         0: 10,

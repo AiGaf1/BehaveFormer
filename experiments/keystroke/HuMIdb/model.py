@@ -1,7 +1,7 @@
 import torch
 from torch import nn
 
-from experiments.keystroke.common.modeling import (
+from experiments.common.modeling import (
     PositionalEncoding,
     TransformerEncoder,
     TransformerEncoderLayer,
