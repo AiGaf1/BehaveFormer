@@ -1,121 +1,28 @@
-from torch import nn
 import torch
+from torch import nn
 
-class PositionalEncoding(nn.Module):
-    def __init__(self, k, d_model, seq_len):
+from experiments.common.modeling import CombinedTransformerEncoder, PositionalEncoding, build_projection_head
+
+
+class _Stream(nn.Module):
+    def __init__(self, feature_count, seq_len, heads, seq_heads):
         super().__init__()
-        
-        self.embedding = nn.Parameter(torch.zeros([k, d_model], dtype=torch.float), requires_grad=True)
-        nn.init.xavier_uniform_(self.embedding, gain=1)
-        self.positions = torch.tensor([i for i in range(seq_len)], requires_grad=False).unsqueeze(1).repeat(1, k)
-        interval = seq_len / k
-        self.mu = nn.Parameter((torch.arange(k, dtype=torch.float) * interval).unsqueeze(0))
-        self.sigma = nn.Parameter(torch.full((1, k), 50.0))
-        
-    def normal_pdf(self, pos, mu, sigma):
-        a = pos - mu
-        log_p = -1*torch.mul(a, a)/(2*(sigma**2)) - torch.log(sigma)
-        return torch.nn.functional.softmax(log_p, dim=1)
+        self.pos_encoding = PositionalEncoding(20, feature_count, seq_len)
+        self.encoder = CombinedTransformerEncoder(feature_count, heads, seq_heads, seq_len)
 
-    def forward(self, inputs):
-        pdfs = self.normal_pdf(self.positions, self.mu, self.sigma)
-        pos_enc = torch.matmul(pdfs, self.embedding)
-        
-        return inputs + pos_enc.unsqueeze(0).repeat(inputs.size(0), 1, 1)
-    
-class TransformerEncoderLayer(nn.Module):
-    def __init__(self, d_model, heads, _heads, dropout, seq_len):
-        super(TransformerEncoderLayer, self).__init__()
-        
-        self.attention = nn.MultiheadAttention(d_model, heads, batch_first=True)
-        self._attention = nn.MultiheadAttention(seq_len, _heads, batch_first=True)
-        
-        self.attn_norm = nn.LayerNorm(d_model)
-        
-        self.cnn_units = 1
-        
-        self.cnn = nn.Sequential(
-            nn.Conv2d(1, self.cnn_units, (1, 1)),
-            nn.BatchNorm2d(self.cnn_units),
-            nn.Dropout(dropout),
-            nn.ReLU(),
-            nn.Conv2d(self.cnn_units, self.cnn_units, (3, 3), padding=1),
-            nn.BatchNorm2d(self.cnn_units),
-            nn.Dropout(dropout),
-            nn.ReLU(),
-            nn.Conv2d(self.cnn_units, 1, (5, 5), padding=2),
-            nn.BatchNorm2d(1),
-            nn.Dropout(dropout),
-            nn.ReLU()
-        )
-        
-        self.final_norm = nn.LayerNorm(d_model)
+    def forward(self, x):
+        return torch.flatten(self.encoder(self.pos_encoding(x)), 1, 2)
 
-    def forward(self, src, src_mask=None):
-        src = self.attn_norm(src + self.attention(src, src, src)[0] + self._attention(src.transpose(-1, -2), src.transpose(-1, -2), src.transpose(-1, -2))[0].transpose(-1, -2))
-        
-        src = self.final_norm(src + self.cnn(src.unsqueeze(dim=1)).squeeze(dim=1))
-            
-        return src
-    
-class TransformerEncoder(nn.Module):
-    def __init__(self, d_model, heads, _heads, seq_len, num_layer=2, dropout=0.1):
-        super(TransformerEncoder, self).__init__()
 
-        self.layers = nn.ModuleList()
-        for i in range(num_layer):
-            self.layers.append(TransformerEncoderLayer(d_model, heads, _heads, dropout, seq_len))
-
-    def forward(self, src):
-        for layer in self.layers:
-            src = layer(src)
-
-        return src
-    
-class Transformer(nn.Module):
-    def __init__(self, num_layer, d_model, k, heads, _heads, seq_len, trg_len, dropout):
-        super(Transformer, self).__init__()
-
-        self.pos_encoding = PositionalEncoding(k, d_model, seq_len)
-
-        self.encoder = nn.DataParallel(TransformerEncoder(d_model, heads, _heads, seq_len, num_layer, dropout))
-
-    def forward(self, inputs):
-        encoded_inputs = self.pos_encoding(inputs)
-
-        return self.encoder(encoded_inputs)
-    
 class Model(nn.Module):
-    def __init__(self, keystroke_feature_count, imu_feature_count, keystroke_l, imu_l, trg_len):
-        super(Model, self).__init__()
-        
-        self.keystroke_transformer = Transformer(5, keystroke_feature_count, 20, 5, 10, keystroke_l, trg_len, 0.1)
-        self.imu_transformer = Transformer(5, imu_feature_count, 20, 6, 10, imu_l, trg_len, 0.1)
-        
-        self.linear_key = nn.Sequential(
-            nn.Linear(500, 250),
-            nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(250, trg_len),
-            nn.ReLU()
-        )
-        
-        self.linear_imu = nn.Sequential(
-            nn.Linear(2400, 1200),
-            nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(1200, trg_len),
-            nn.ReLU()
-        )
-        
-        self.linear_final = nn.Linear(128, trg_len)
-        
+    def __init__(self, ks_features, imu_features, ks_len, imu_len, trg_len):
+        super().__init__()
+        self.ks_stream  = _Stream(ks_features,  ks_len,  heads=5, seq_heads=10)
+        self.imu_stream = _Stream(imu_features, imu_len, heads=6, seq_heads=10)
+        self.ks_head    = build_projection_head(ks_features  * ks_len,  (ks_features  * ks_len)  // 2, trg_len)
+        self.imu_head   = build_projection_head(imu_features * imu_len, (imu_features * imu_len) // 2, trg_len)
+        self.final      = nn.Linear(trg_len * 2, trg_len)
+
     def forward(self, inputs):
-        keystroke_inputs, imu_inputs = inputs
-        
-        keystroke_out = self.linear_key(torch.flatten(self.keystroke_transformer(keystroke_inputs), start_dim=1, end_dim=2))
-        imu_out = self.linear_imu(torch.flatten(self.imu_transformer(imu_inputs), start_dim=1, end_dim=2))
-        
-        concat_out = torch.concat([keystroke_out, imu_out], dim=-1)
-        
-        return self.linear_final(concat_out)
+        ks, imu = inputs
+        return self.final(torch.cat([self.ks_head(self.ks_stream(ks)), self.imu_head(self.imu_stream(imu))], dim=-1))
