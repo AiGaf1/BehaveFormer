@@ -1,5 +1,6 @@
 import json
 import os
+import warnings
 from pathlib import Path
 
 import pytorch_lightning as pl
@@ -9,6 +10,35 @@ from pytorch_lightning.loggers import WandbLogger
 from torch.utils.data import DataLoader
 
 from experiments.common.loss import triplet_loss
+
+_CHECKPOINT_DIR_WARNING = r"Checkpoint directory .* exists and is not empty\."
+_VALID_WANDB_WATCH_MODES = {"none", "gradients", "parameters", "all"}
+
+
+def _env_flag(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _build_model_runner(model):
+    compile_enabled = _env_flag("BEHAVEFORMER_TORCH_COMPILE", True)
+    if compile_enabled and hasattr(torch, "compile"):
+        return torch.compile(model, dynamic=True), True
+    return model, False
+
+
+def _resolve_wandb_watch_mode() -> str:
+    watch_mode = os.getenv("BEHAVEFORMER_WANDB_WATCH", "none").strip().lower()
+    if watch_mode not in _VALID_WANDB_WATCH_MODES:
+        valid_modes = ", ".join(sorted(_VALID_WANDB_WATCH_MODES))
+        raise ValueError(f"Unsupported BEHAVEFORMER_WANDB_WATCH={watch_mode!r}; expected one of: {valid_modes}")
+    return watch_mode
+
+
+def _configure_warning_filters():
+    warnings.filterwarnings("ignore", message=_CHECKPOINT_DIR_WARNING, category=UserWarning)
 
 
 class _KeystrokeLightningModule(pl.LightningModule):
@@ -28,7 +58,7 @@ class _KeystrokeLightningModule(pl.LightningModule):
         self.compute_val_eer = compute_val_eer
         self.learning_rate = learning_rate
         self.model = model_factory()
-        self._compiled_model = torch.compile(self.model, dynamic=True)
+        self._model_runner, self.compile_enabled = _build_model_runner(self.model)
         self.loss_fn = loss_fn if loss_fn is not None else triplet_loss()
         self.validation_embeddings = []
         self.train_dataset = train_dataset
@@ -42,7 +72,7 @@ class _KeystrokeLightningModule(pl.LightningModule):
 
     def training_step(self, batch, _):
         sequences, labels = batch
-        embeddings = self._compiled_model(sequences)
+        embeddings = self._model_runner(sequences)
         loss = self.loss_fn(embeddings, labels)
         self.log("train_loss", loss, on_step=False, on_epoch=True, prog_bar=True, logger=True, batch_size=len(labels))
         return loss
@@ -51,7 +81,7 @@ class _KeystrokeLightningModule(pl.LightningModule):
         self.validation_embeddings = []
 
     def validation_step(self, batch, _):
-        self.validation_embeddings.append(self._compiled_model(batch).detach())
+        self.validation_embeddings.append(self._model_runner(batch).detach())
 
     def on_validation_epoch_end(self):
         val_embeddings = torch.cat(self.validation_embeddings, dim=0)
@@ -78,7 +108,7 @@ class _KeystrokeLightningModule(pl.LightningModule):
     @torch.no_grad()
     def _collect_embeddings(self, loader):
         self.model.eval()
-        embeddings = [self._compiled_model(batch.to(self.device)).detach() for batch in loader]
+        embeddings = [self._model_runner(batch.to(self.device)).detach() for batch in loader]
         self.model.train()
         return torch.cat(embeddings, dim=0)
 
@@ -87,7 +117,7 @@ class _KeystrokeLightningModule(pl.LightningModule):
 
 
 
-def _setup_wandb(project_root: Path, model):
+def _setup_wandb(project_root: Path, model, compile_enabled: bool):
     if os.getenv("BEHAVEFORMER_WANDB_ENABLED") != "1":
         return None
 
@@ -112,10 +142,18 @@ def _setup_wandb(project_root: Path, model):
             "model_class_name": model.__class__.__name__,
             "model_parameter_count": sum(p.numel() for p in model.parameters()),
             "trainable_parameter_count": sum(p.numel() for p in model.parameters() if p.requires_grad),
+            "torch_compile_enabled": compile_enabled,
         },
         allow_val_change=True,
     )
-    # logger.watch(model, log="gradients", log_freq=100)
+    watch_mode = _resolve_wandb_watch_mode()
+    if watch_mode != "none":
+        if compile_enabled:
+            raise RuntimeError(
+                "BEHAVEFORMER_WANDB_WATCH requires eager execution. "
+                "Re-run with BEHAVEFORMER_TORCH_COMPILE=0 to enable W&B watch safely."
+            )
+        logger.watch(model, log=watch_mode, log_freq=int(os.getenv("BEHAVEFORMER_WANDB_WATCH_FREQ", 100)))
     return logger
 
 
@@ -139,6 +177,7 @@ def run_keystroke_training(
 ):
     best_model_dir = Path(best_model_dir)
     best_model_dir.mkdir(exist_ok=True)
+    _configure_warning_filters()
 
     torch.set_float32_matmul_precision("high")
 
@@ -174,7 +213,7 @@ def run_keystroke_training(
         train_eval_loader=train_eval_loader,
         metrics_every_n_epochs=metrics_every_n_epochs,
     )
-    wandb_logger = _setup_wandb(project_root, module.model)
+    wandb_logger = _setup_wandb(project_root, module.model, module.compile_enabled)
 
     best_ckpt = ModelCheckpoint(
         dirpath=str(best_model_dir),
@@ -185,13 +224,16 @@ def run_keystroke_training(
         auto_insert_metric_name=False,
     )
 
+    requested_log_every_n_steps = int(os.getenv("BEHAVEFORMER_LOG_EVERY_N_STEPS", 50))
+    log_every_n_steps = max(1, min(requested_log_every_n_steps, max(1, len(train_loader))))
+
     trainer = pl.Trainer(
         accelerator="gpu",
         devices=1,
         max_epochs=epochs,
         callbacks=[best_ckpt],
         logger=wandb_logger or False,
-        log_every_n_steps=int(os.getenv("BEHAVEFORMER_LOG_EVERY_N_STEPS", 50)),
+        log_every_n_steps=log_every_n_steps,
         enable_model_summary=False,
         gradient_clip_val=1.0,
         num_sanity_val_steps=0,

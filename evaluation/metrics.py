@@ -1,10 +1,11 @@
 import math
-import numpy as np
-import pandas as pd
-import torch
-import seaborn as sns
+
 import matplotlib as mpl
 import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import seaborn as sns
+import torch
 from sklearn.manifold import TSNE
 from sklearn.metrics import silhouette_score
 
@@ -29,7 +30,7 @@ class Metric:
         far = (scores_i.unsqueeze(1) >= thresholds).float().mean(0)
         frr = (scores_g.unsqueeze(1) <  thresholds).float().mean(0)
 
-        idx = (far - frr).abs().argmin().item()
+        idx = int((far - frr).abs().argmin().item())
         eer = ((far[idx] + frr[idx]) / 2 * 100).item()
         return eer, thresholds[idx].item()
 
@@ -119,28 +120,33 @@ class Metric:
 
     @staticmethod
     def _predictions(scores, threshold):
-        return [1 if s <= threshold else 0 for s in scores]
+        if isinstance(scores, torch.Tensor):
+            scores = scores.float().cpu().numpy()
+        elif not isinstance(scores, np.ndarray):
+            scores = np.asarray(scores)
+        return (scores <= threshold).astype(np.int8)
 
     @staticmethod
     def calculate_usability(scores, threshold, periods, labels):
         """Fraction of legitimate-user time that is accepted."""
         preds = Metric._predictions(scores, threshold)
-        total = accepted = 0
-        for pred, period, label in zip(preds, periods, labels):
-            if label == 0:
-                continue
-            total += period
-            if pred == 1:
-                accepted += period
-        return accepted / total if total else 0
+        periods = np.asarray(periods)
+        labels = np.asarray(labels)
+        genuine_mask = labels == 1
+        total = periods[genuine_mask].sum()
+        accepted = periods[genuine_mask & (preds == 1)].sum()
+        return float(accepted / total) if total else 0.0
 
     @staticmethod
     def _window_lengths(preds, periods, labels, trigger_label, trigger_pred):
         """Generic helper: collect window lengths between trigger events."""
+        periods = np.asarray(periods)
+        labels = np.asarray(labels)
+        mask = labels != trigger_label
+        preds_f = preds[mask]
+        periods_f = periods[mask]
         values, time, active = [], 0, True
-        for pred, period, label in zip(preds, periods, labels):
-            if label == trigger_label:
-                continue
+        for pred, period in zip(preds_f, periods_f):
             if pred == trigger_pred and active:
                 values.append(time)
                 time, active = 0, False

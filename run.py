@@ -4,7 +4,7 @@ import os
 import sys
 from pathlib import Path
 
-from utils.wandb import build_config, build_run_name, init_run, load_env_file, stream_subprocess
+from utils.wandb import build_config, build_run_id, build_run_name, init_run, load_env_file, stream_subprocess
 
 ROOT = Path(__file__).parent.resolve()
 
@@ -82,7 +82,7 @@ def use_native_wandb(args) -> bool:
     return args.wandb and use_native_lightning(args)
 
 
-def subprocess_env_for_native_wandb(args, config: dict, tags: list[str]) -> dict:
+def subprocess_env_for_native_wandb(args, config: dict, tags: list[str], run_id: str) -> dict:
     load_env_file()
 
     env = os.environ.copy()
@@ -92,6 +92,7 @@ def subprocess_env_for_native_wandb(args, config: dict, tags: list[str]) -> dict
             "BEHAVEFORMER_WANDB_PROJECT": args.wandb_project,
             "BEHAVEFORMER_WANDB_ENTITY": args.wandb_entity or "",
             "BEHAVEFORMER_WANDB_RUN_NAME": build_run_name(args),
+            "BEHAVEFORMER_WANDB_RUN_ID": run_id,
             "BEHAVEFORMER_WANDB_CONFIG_JSON": json.dumps(config),
             "BEHAVEFORMER_WANDB_TAGS_JSON": json.dumps(tags),
         }
@@ -114,9 +115,10 @@ if __name__ == "__main__":
 
     run = None
     subprocess_env = None
+    run_id = build_run_id()
     native_lightning = use_native_lightning(args)
     if use_native_wandb(args):
-        subprocess_env = subprocess_env_for_native_wandb(args, config, tags)
+        subprocess_env = subprocess_env_for_native_wandb(args, config, tags, run_id)
     else:
         run = init_run(
             enabled=args.wandb,
@@ -124,6 +126,7 @@ if __name__ == "__main__":
             entity=args.wandb_entity,
             config=config,
             run_name=build_run_name(args),
+            run_id=run_id,
             tags=tags,
         )
 
