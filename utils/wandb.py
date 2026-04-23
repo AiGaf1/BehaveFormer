@@ -1,6 +1,7 @@
 import os
 import re
 import subprocess
+from datetime import datetime
 from importlib import import_module
 from pathlib import Path
 from typing import Iterable
@@ -34,7 +35,18 @@ def load_env_file(env_path: Path | str = ".env") -> None:
 
 
 def build_run_name(args) -> str:
-    return "-".join(part for part in [args.dataset, args.model, args.mode, args.imu] if part)
+    model_names = {
+        "keystroke": "k",
+        "keystroke_imu": "k_imu",
+        "tl": "tl",
+    }
+    model = model_names.get(args.model, args.model)
+    return "-".join(part for part in [args.dataset, model, args.mode, args.imu] if part)
+
+
+def build_run_id() -> str:
+    return datetime.now().strftime("%Y%m%d-%H%M%S")
+
 
 
 def build_config(args) -> dict:
@@ -84,6 +96,7 @@ def init_run(
     project: str,
     config: dict,
     run_name: str,
+    run_id: str | None = None,
     tags: Iterable[str] | None = None,
     entity: str | None = None,
 ):
@@ -95,6 +108,7 @@ def init_run(
         entity=entity,
         config=config,
         name=run_name,
+        id=run_id,
         tags=list(tags or []),
         save_code=True,
     )
