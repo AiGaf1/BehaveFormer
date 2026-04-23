@@ -1,13 +1,7 @@
-import inspect
 import logging
-import os
 
 
-def get_logger(name: str | None = None) -> logging.Logger:
-    if name is None:
-        frame = inspect.stack()[1]
-        name = os.path.basename(frame.filename)
-
+def get_logger(name: str) -> logging.Logger:
     logger = logging.getLogger(name)
 
     if not logger.handlers:
