@@ -53,6 +53,8 @@
             "two_types": 24,
             "all": 36
         },
+        "key_embedding_dim": 16,
+        "embedded_keystroke_model_dim": 20,
         "target_len": 64,
         "number_of_enrollment_sessions": {
             "aalto": 10,

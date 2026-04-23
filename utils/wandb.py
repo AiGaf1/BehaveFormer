@@ -57,6 +57,8 @@ def build_config(args) -> dict:
         "gpu": project_config["GPU"],
         "learning_rate": hyperparams["learning_rate"],
         "target_len": hyperparams["target_len"],
+        "key_embedding_dim": hyperparams.get("key_embedding_dim"),
+        "embedded_keystroke_model_dim": hyperparams.get("embedded_keystroke_model_dim"),
         "keystroke_sequence_len": data_config["keystroke_sequence_len"],
         "resume_from_epoch": _maybe_int(args.initepoch) if resuming else None,
         "resume_from_checkpoint_tar": str(checkpoint_dir / f"training_{args.initepoch}.tar") if resuming else None,
@@ -109,7 +111,13 @@ def stream_subprocess(
         return subprocess.Popen(command, cwd=cwd, env=env).wait()
 
     process = subprocess.Popen(
-        command, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, env=env,
+        command,
+        cwd=cwd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+        env=env,
     )
     for line in process.stdout or []:
         print(line, end="")
