@@ -16,10 +16,10 @@ HMOG_SPEC = NestedKeystrokeDatasetSpec(
     dataset_key="hmog",
     dataset_dir_name="HMOGDB",
     validation_sequences_per_session=50,
-    compute_periodic_metrics=True,
     train_metrics_subset_users=256,
     metrics_every_n_epochs=5,
-    keystroke_scale_map={index: 1000 for index in range(9)},
+    keystroke_columns=(0, 2, 1),  # hold_time, flight_time, key_code
+    keystroke_scale_map={0: 1000, 2: 1000},
     imu_scale_map={
         0: 10, 1: 10, 2: 10,
         3: 1000, 4: 1000, 5: 1000,

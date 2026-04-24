@@ -1,13 +1,4 @@
-from pytorch_metric_learning import losses
+from pytorch_metric_learning.losses import SupConLoss
+from torch.nn import TripletMarginLoss as TripletLoss
 
-
-def triplet_loss(margin=0.2):
-    return losses.TripletMarginLoss(margin=margin)
-
-
-def supcon_loss(temperature=0.07):
-    return losses.SupConLoss(temperature=temperature)
-
-
-def infonce_loss(temperature=0.07):
-    return losses.NTXentLoss(temperature=temperature)
+__all__ = ["TripletLoss", "SupConLoss"]

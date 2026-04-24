@@ -1,4 +1,3 @@
-import os
 import pickle
 import subprocess
 import sys
@@ -7,10 +6,10 @@ from pathlib import Path
 
 import numpy as np
 import torch
-
 from Config import Config
 from metrics import Metric
-from experiments.common.datasets import EvalDataset, TrainDataset, scale_features, sample_user_subset
+
+from experiments.common.datasets import EvalDataset, TrainDataset, feature_ranges, key_vocab_size, sample_user_subset, scale_features
 from experiments.common.lightning import run_keystroke_training
 from experiments.common.logger import get_logger
 
@@ -28,7 +27,6 @@ class NestedKeystrokeDatasetSpec:
     keystroke_scale_map: dict[int, float]
     imu_scale_map: dict[int, float]
     keystroke_columns: tuple[int, ...] | None = None
-    compute_periodic_metrics: bool = False
     train_metrics_subset_users: int | None = None
     metrics_every_n_epochs: int = 5
 
@@ -68,14 +66,18 @@ def _window_time(dataset_key: str, session) -> float:
 
 def _make_nested_full_metrics_fn(raw_data, *, dataset_key, target_len, enrollment_sessions, verify_sessions):
     n_users = len(raw_data)
-
-    def _get_periods(user_id):
-        periods = [_window_time(dataset_key, raw_data[user_id][enrollment_sessions + j]) for j in range(verify_sessions)]
-        for other in range(n_users):
-            if other != user_id:
-                for j in range(verify_sessions):
-                    periods.append(_window_time(dataset_key, raw_data[other][enrollment_sessions + j]))
-        return periods
+    distance_fn = Metric._get_distance_fn(dataset_key)
+    labels = torch.tensor([1] * verify_sessions + [0] * ((n_users - 1) * verify_sessions))
+    periods = [
+        [_window_time(dataset_key, raw_data[user_id][enrollment_sessions + j]) for j in range(verify_sessions)]
+        + [
+            _window_time(dataset_key, raw_data[other][enrollment_sessions + j])
+            for other in range(n_users)
+            if other != user_id
+            for j in range(verify_sessions)
+        ]
+        for user_id in range(n_users)
+    ]
 
     def compute(flat_embeddings):
         embeddings = flat_embeddings.view(n_users, len(raw_data[0]), len(raw_data[0][0]), target_len)
@@ -88,16 +90,13 @@ def _make_nested_full_metrics_fn(raw_data, *, dataset_key, target_len, enrollmen
                 embeddings[:user_id, enrollment_sessions:].flatten(0, 1),
                 embeddings[user_id + 1:, enrollment_sessions:].flatten(0, 1),
             ])
-            scores = Metric._get_distance_fn(dataset_key)(torch.cat([genuine, impostor]), enroll)
-            import torch as _torch
-            labels = _torch.tensor([1] * verify_sessions + [0] * ((n_users - 1) * verify_sessions))
-            periods = _get_periods(user_id)
+            scores = distance_fn(torch.cat([genuine, impostor]), enroll)
             acc, threshold = Metric.eer_compute(scores[:verify_sessions], scores[verify_sessions:])
             acc_list.append(acc)
-            usab_list.append(Metric.calculate_usability(scores, threshold, periods, labels))
-            tcr_list.append(Metric.calculate_TCR(scores, threshold, periods, labels))
-            fawi_list.append(Metric.calculate_FAWI(scores, threshold, periods, labels))
-            frwi_list.append(Metric.calculate_FRWI(scores, threshold, periods, labels))
+            usab_list.append(Metric.calculate_usability(scores, threshold, periods[user_id], labels))
+            tcr_list.append(Metric.calculate_TCR(scores, threshold, periods[user_id], labels))
+            fawi_list.append(Metric.calculate_FAWI(scores, threshold, periods[user_id], labels))
+            frwi_list.append(Metric.calculate_FRWI(scores, threshold, periods[user_id], labels))
         return {
             "eer":       float(100 - np.mean(acc_list)),
             "usability": float(np.mean(usab_list)),
@@ -134,13 +133,6 @@ def run_nested_keystroke_training_script(*, spec: NestedKeystrokeDatasetSpec, pr
         for idx, session in enumerate(user):
             user[idx] = session[:spec.validation_sequences_per_session]
 
-    vocab_size = int(max(
-        sequence[0][:, -1].max()
-        for user in training_data
-        for session in user
-        for sequence in session
-    )) + 1
-
     scale_features(training_data,  spec.keystroke_scale_map, spec.imu_scale_map)
     scale_features(validation_data, spec.keystroke_scale_map, spec.imu_scale_map)
 
@@ -154,15 +146,29 @@ def run_nested_keystroke_training_script(*, spec: NestedKeystrokeDatasetSpec, pr
     verify_sessions     = hyperparams["number_of_verify_sessions"][spec.dataset_key]
 
     columns = spec.keystroke_columns
+    vocab_size = key_vocab_size(training_data, columns)
+    ranges = feature_ranges(training_data, columns)
 
     compute_val_metrics = compute_train_metrics = train_eval_dataset = None
-    if spec.compute_periodic_metrics:
+    if spec.train_metrics_subset_users is not None:
         train_metrics_source = sample_user_subset(training_data, spec.train_metrics_subset_users)
         train_metrics_data = [[session[:spec.validation_sequences_per_session] for session in user] for user in train_metrics_source]
         LOGGER.info("Using %s/%s training users for periodic %s metrics", len(train_metrics_data), len(training_data), spec.dataset_key)
-        compute_val_metrics   = _make_nested_full_metrics_fn(validation_data,   dataset_key=spec.dataset_key, target_len=target_len, enrollment_sessions=enrollment_sessions, verify_sessions=verify_sessions)
-        compute_train_metrics = _make_nested_full_metrics_fn(train_metrics_data, dataset_key=spec.dataset_key, target_len=target_len, enrollment_sessions=enrollment_sessions, verify_sessions=verify_sessions)
-        train_eval_dataset    = EvalDataset(train_metrics_data, columns=columns)
+        compute_val_metrics = _make_nested_full_metrics_fn(
+            validation_data,
+            dataset_key=spec.dataset_key,
+            target_len=target_len,
+            enrollment_sessions=enrollment_sessions,
+            verify_sessions=verify_sessions,
+        )
+        compute_train_metrics = _make_nested_full_metrics_fn(
+            train_metrics_data,
+            dataset_key=spec.dataset_key,
+            target_len=target_len,
+            enrollment_sessions=enrollment_sessions,
+            verify_sessions=verify_sessions,
+        )
+        train_eval_dataset = EvalDataset(train_metrics_data, columns=columns)
 
     run_keystroke_training(
         project_root=project_root,
@@ -172,7 +178,7 @@ def run_nested_keystroke_training_script(*, spec: NestedKeystrokeDatasetSpec, pr
         batch_size=batch_size,
         learning_rate=learning_rate,
         epochs=int(argv[0]),
-        model_factory=lambda: model_factory(seq_len, target_len, vocab_size, embed_dim),
+        model_factory=lambda: model_factory(seq_len, target_len, vocab_size, embed_dim, ranges),
         compute_val_metrics=compute_val_metrics,
         compute_train_metrics=compute_train_metrics,
         train_eval_dataset=train_eval_dataset,

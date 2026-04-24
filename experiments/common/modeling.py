@@ -1,3 +1,5 @@
+import math
+
 import torch
 from torch import nn
 
@@ -5,36 +7,40 @@ from torch import nn
 class KeystrokeModel(nn.Module):
     """Single-stream keystroke transformer with key embedding. Used by AaltoDB and HMOGDB."""
 
-    def __init__(self, seq_len, target_len, vocab_size, embed_dim, num_layers=6, heads=5, dropout=0.1):
+    def __init__(self, seq_len, target_len, vocab_size, embed_dim, feature_ranges, lff_features=8, num_layers=6, heads=5, dropout=0.1):
         super().__init__()
-        timing_features = 9
-        d_model = timing_features + embed_dim
-        self.key_embedding = KeyEmbedding(vocab_size, embed_dim)
+        self.lff = LearnableFourierFeatures(feature_ranges, lff_features)
+        d_model = self.lff.d_out + embed_dim
+        self.key_embedding = nn.Embedding(vocab_size, embed_dim)
         self.pos_encoding = PositionalEncoding(20, d_model, seq_len)
         self.encoder = TransformerEncoder(d_model, heads, num_layers, dropout)
         self.ff = build_projection_head(d_model * seq_len, (d_model * seq_len) // 2, target_len)
 
     def forward(self, x):
-        x = self.pos_encoding(self.key_embedding(x))
+        timing = x[:, :, :-1]
+        keys = x[:, :, -1].long()
+        x = torch.cat([self.lff(timing), self.key_embedding(keys)], dim=-1)
+        x = self.pos_encoding(x)
         return self.ff(torch.flatten(self.encoder(x), 1, 2))
 
 
-class KeyEmbedding(nn.Module):
-    """Replaces the raw integer key-code column with a learned embedding.
-
-    Expects input of shape (batch, seq_len, feature_count) where the last
-    column contains integer key codes. Returns a tensor of shape
-    (batch, seq_len, feature_count - 1 + embed_dim).
-    """
-
-    def __init__(self, vocab_size: int, embed_dim: int):
+class LearnableFourierFeatures(nn.Module):
+    def __init__(self, feature_dict: dict, num_features: int):
         super().__init__()
-        self.embedding = nn.Embedding(vocab_size, embed_dim)
+        periods = [
+            torch.logspace(math.log10(bounds["min"]), math.log10(bounds["max"]), steps=num_features)
+            for bounds in feature_dict.values()
+        ]
+        freq = 2 * torch.pi / torch.stack(periods)
+        self.freq: torch.Tensor
+        self.register_buffer("freq", freq)
+        self.scales_raw = nn.Parameter(torch.randn_like(freq) * 0.1)
+        self.d_out = 2 * len(feature_dict) * num_features
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        timing = x[:, :, :-1]
-        keys = x[:, :, -1].long()
-        return torch.cat([timing, self.embedding(keys)], dim=-1)
+    def forward(self, x):
+        proj = x.unsqueeze(-1) * self.freq * torch.sigmoid(self.scales_raw)
+        fourier = torch.stack([proj.sin(), proj.cos()], dim=-1)
+        return fourier.flatten(start_dim=-3)
 
 
 class PositionalEncoding(nn.Module):

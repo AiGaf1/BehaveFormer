@@ -2,6 +2,10 @@ import numpy as np
 from torch.utils.data import Dataset
 
 
+def _session_sequences(session):
+    return (session,) if isinstance(session, np.ndarray) else session
+
+
 def _select(sequence, columns, seq_len=None):
     ks = sequence if isinstance(sequence, np.ndarray) else sequence[0]
     if columns is not None:
@@ -12,6 +16,29 @@ def _select(sequence, columns, seq_len=None):
         out[:length] = ks[:length]
         return out
     return ks.astype(np.float32)
+
+
+def iter_keystroke_sequences(data, columns=None):
+    for user in data:
+        for session in user:
+            for sequence in _session_sequences(session):
+                yield _select(sequence, columns)
+
+
+def key_vocab_size(data, columns=None):
+    return int(max(sequence[:, -1].max() for sequence in iter_keystroke_sequences(data, columns))) + 1
+
+
+def feature_ranges(data, columns=None):
+    timing = np.concatenate([sequence[:, :-1] for sequence in iter_keystroke_sequences(data, columns)])
+    abs_timing = np.abs(timing)
+    return {
+        f"timing_{idx}": {
+            "min": float(abs_timing[:, idx][abs_timing[:, idx] > 0].min()),
+            "max": float(abs_timing[:, idx].max()),
+        }
+        for idx in range(abs_timing.shape[1])
+    }
 
 
 class TrainDataset(Dataset):
@@ -42,18 +69,19 @@ class TrainDataset(Dataset):
 
     def __getitem__(self, idx):
         user_id = int(self._user_ids[idx])
-        session = np.random.randint(len(self.data[user_id]))
-        seq     = np.random.randint(len(self.data[user_id][session]))
-        return _select(self.data[user_id][session][seq], self.columns, self.seq_len), user_id
+        session = self.data[user_id][np.random.randint(len(self.data[user_id]))]
+        sequences = _session_sequences(session)
+        sequence = sequences[np.random.randint(len(sequences))]
+        return _select(sequence, self.columns, self.seq_len), user_id
 
 
 class EvalDataset(Dataset):
-    """Flat user × session × sequence index over nested eval data."""
+    """Flat user x session x sequence index over eval data."""
 
     def __init__(self, data, columns=None, seq_len=None):
         self.data = data
         self.n_sessions = len(data[0])
-        self.n_seqs = len(data[0][0])
+        self.n_seqs = len(_session_sequences(data[0][0]))
         self.columns = columns
         self.seq_len = seq_len
 
@@ -64,7 +92,7 @@ class EvalDataset(Dataset):
         user    = idx // (self.n_sessions * self.n_seqs)
         session = (idx // self.n_seqs) % self.n_sessions
         seq     = idx % self.n_seqs
-        return _select(self.data[user][session][seq], self.columns, self.seq_len)
+        return _select(_session_sequences(self.data[user][session])[seq], self.columns, self.seq_len)
 
 
 def scale_features(data, keystroke_scale_map, imu_scale_map):
