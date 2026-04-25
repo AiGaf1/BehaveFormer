@@ -5,26 +5,52 @@ from torch import nn
 
 
 class KeystrokeModel(nn.Module):
-    """Single-stream keystroke transformer with key embedding. Used by AaltoDB and HMOGDB."""
+    """Keystroke-only transformer used by AaltoDB and HMOGDB.
 
-    def __init__(self, seq_len, target_len, vocab_size, embed_dim, feature_ranges, lff_features=8, num_layers=6, heads=5, dropout=0.1):
+    Input shape is (batch, sequence, features). The last feature must be the key
+    code; every feature before it is treated as a timing value.
+    """
+
+    def __init__(
+        self,
+        seq_len,
+        target_len,
+        vocab_size,
+        embed_dim,
+        feature_ranges,
+        lff_features=8,
+        num_layers=6,
+        heads=5,
+        dropout=0.1,
+    ):
         super().__init__()
-        self.lff = LearnableFourierFeatures(feature_ranges, lff_features)
-        d_model = self.lff.d_out + embed_dim
+        self.timing_encoder = LearnableFourierFeatures(feature_ranges, lff_features)
         self.key_embedding = nn.Embedding(vocab_size, embed_dim)
+        d_model = self.timing_encoder.d_out + embed_dim
+
         self.pos_encoding = PositionalEncoding(20, d_model, seq_len)
-        self.encoder = TransformerEncoder(d_model, heads, num_layers, dropout)
-        self.ff = build_projection_head(d_model * seq_len, (d_model * seq_len) // 2, target_len)
+        self.encoder = nn.TransformerEncoder(
+            nn.TransformerEncoderLayer(d_model=d_model, nhead=heads, dropout=dropout, batch_first=True),
+            num_layers=num_layers,
+            enable_nested_tensor=False,
+        )
+        self.projection = build_projection_head(d_model * seq_len, (d_model * seq_len) // 2, target_len)
 
     def forward(self, x):
-        timing = x[:, :, :-1]
-        keys = x[:, :, -1].long()
-        x = torch.cat([self.lff(timing), self.key_embedding(keys)], dim=-1)
+        timing_values = x[:, :, :-1]
+        key_ids = x[:, :, -1].long()
+
+        x = torch.cat(
+            [self.timing_encoder(timing_values), self.key_embedding(key_ids)],
+            dim=-1,
+        )
         x = self.pos_encoding(x)
-        return self.ff(torch.flatten(self.encoder(x), 1, 2))
+        return self.projection(torch.flatten(self.encoder(x), 1, 2))
 
 
 class LearnableFourierFeatures(nn.Module):
+    """Encode raw timing values with learned sin/cos frequency scales."""
+
     def __init__(self, feature_dict: dict, num_features: int):
         super().__init__()
         periods = [
@@ -44,44 +70,25 @@ class LearnableFourierFeatures(nn.Module):
 
 
 class PositionalEncoding(nn.Module):
+    """Learned Gaussian positional encoding from the original BehaveFormer model."""
+
     def __init__(self, k, d_model, seq_len):
         super().__init__()
 
         self.embedding = nn.Parameter(torch.zeros([k, d_model], dtype=torch.float), requires_grad=True)
         nn.init.xavier_uniform_(self.embedding, gain=1)
+        self.positions: torch.Tensor
         self.register_buffer("positions", torch.arange(seq_len).unsqueeze(1).repeat(1, k))
         interval = seq_len / k
         self.mu = nn.Parameter((torch.arange(k, dtype=torch.float) * interval).unsqueeze(0))
         self.sigma = nn.Parameter(torch.full((1, k), 50.0))
 
-    def normal_pdf(self, pos, mu, sigma):
-        distance = pos - mu
-        log_p = -1 * torch.mul(distance, distance) / (2 * (sigma**2)) - torch.log(sigma)
-        return torch.nn.functional.softmax(log_p, dim=1)
-
     def forward(self, inputs):
-        pdfs = self.normal_pdf(self.positions, self.mu, self.sigma)
-        pos_enc = torch.matmul(pdfs, self.embedding)
-        return inputs + pos_enc.unsqueeze(0)
+        distance = self.positions - self.mu
+        log_p = -distance * distance / (2 * self.sigma ** 2) - torch.log(self.sigma)
+        pdfs = torch.nn.functional.softmax(log_p, dim=1)
+        return inputs + torch.matmul(pdfs, self.embedding).unsqueeze(0)
 
-
-class TransformerEncoder(nn.Module):
-    def __init__(self, d_model, heads=2, num_layer=2, dropout=0.1):
-        super().__init__()
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=d_model,
-            nhead=heads,
-            dropout=dropout,
-            batch_first=True,
-        )
-        self.encoder = nn.TransformerEncoder(
-            encoder_layer,
-            num_layers=num_layer,
-            enable_nested_tensor=False,
-        )
-
-    def forward(self, src):
-        return self.encoder(src)
 
 
 def build_projection_head(input_dim, hidden_dim, output_dim, dropout=0.1):
@@ -93,7 +100,7 @@ def build_projection_head(input_dim, hidden_dim, output_dim, dropout=0.1):
     )
 
 
-# ── keystroke_imu_combined building blocks ───────────────────────────────────
+# Legacy keystroke_imu_combined building blocks.
 
 class CombinedTransformerEncoderLayer(nn.Module):
     """Dual-attention (feature + sequence axes) + CNN layer used in keystroke_imu_combined."""

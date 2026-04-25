@@ -1,4 +1,3 @@
-import math
 import os
 import pickle
 import shutil
@@ -10,8 +9,14 @@ import numpy as np
 import pandas as pd
 from sklearn.model_selection import train_test_split
 
-sys.path.append(str(Path(__file__).resolve().parents[2] / "utils"))
+_ROOT = Path(__file__).resolve().parents[2]
+sys.path.append(str(_ROOT))
+sys.path.append(str(_ROOT / "utils"))
 from Config import Config
+
+from experiments.common.logger import get_logger
+
+LOGGER = get_logger(__name__)
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DOWNLOAD_FILE = PROJECT_ROOT / "download"
@@ -22,16 +27,25 @@ IMU_COLUMNS   = ["x", "y", "z", "fft_x", "fft_y", "fft_z", "fd_x", "fd_y", "fd_z
 IMU_FULL_COLS = [f"{p}_{c}" for p in IMU_PREFIXES for c in IMU_COLUMNS]
 
 
+_PREP_DIR = Path(__file__).resolve().parent / "prep_data"
+
+
+def maybe_download(file_id: str, target_path: Path) -> None:
+    if target_path.exists() or not file_id:
+        return
+    subprocess.run(f"gdown {file_id}", shell=True, check=True, cwd=target_path.parent)
+
+
 # ── Download / extraction ────────────────────────────────────────────────────
 
 def download_dataset_file(dataset_url, output_path=DOWNLOAD_FILE):
     if not dataset_url:
         raise ValueError("HMOG dataset_url is empty. Add a valid download URL in config.json.")
     if output_path.exists() and output_path.stat().st_size > 0:
-        print(f"INFO: Using existing dataset archive: {output_path}")
+        LOGGER.info("Using existing dataset archive: %s", output_path)
         return
     subprocess.run(["wget", "-c", "-O", str(output_path), dataset_url], check=True)
-    print("Download completed!")
+    LOGGER.info("Download completed!")
 
 
 def extract_zip(zipped_file, to_folder):
@@ -43,9 +57,9 @@ def extract_zip(zipped_file, to_folder):
 
 
 def extract(absolute_path):
-    print("Extracting... 🚀")
+    LOGGER.info("Extracting...")
     extract_zip(Path(absolute_path), DATASET_DIR)
-    print(f"File is unzipped in {DATASET_DIR} folder ✅")
+    LOGGER.info("File is unzipped in %s", DATASET_DIR)
     return DATASET_DIR
 
 
@@ -116,35 +130,14 @@ def shrink_couple_data(keystroke_df):
 
 # ── Feature extraction ───────────────────────────────────────────────────────
 
-def keystroke_feature_extract(keystroke):
-    if keystroke.isnull().values.any():
-        print("WARNING: Original keystroke dataframe contains NaN")
-        keystroke.fillna(0, inplace=True)
-
-    keystroke["press_time"] = keystroke["press_time"].astype(int)
-    n = len(keystroke)
-
-    # Vectorised hold-latency
-    keystroke["hl"]  = keystroke["release_time"] - keystroke["press_time"]
-    keystroke["key"] = keystroke["key_code"]
-
-    # Digraph timings (shifted by 1)
-    keystroke["di_ud"] = keystroke["press_time"].shift(-1)   - keystroke["release_time"]
-    keystroke["di_dd"] = keystroke["press_time"].shift(-1)   - keystroke["press_time"]
-    keystroke["di_uu"] = keystroke["release_time"].shift(-1) - keystroke["release_time"]
-    keystroke["di_du"] = keystroke["release_time"].shift(-1) - keystroke["press_time"]
-
-    # Trigraph timings (shifted by 2)
-    keystroke["tri_ud"] = keystroke["press_time"].shift(-2)   - keystroke["release_time"]
-    keystroke["tri_dd"] = keystroke["press_time"].shift(-2)   - keystroke["press_time"]
-    keystroke["tri_uu"] = keystroke["release_time"].shift(-2) - keystroke["release_time"]
-    keystroke["tri_du"] = keystroke["release_time"].shift(-2) - keystroke["press_time"]
-
-    # Last rows have no valid future context → zero-fill
-    keystroke.iloc[-1, keystroke.columns.get_loc("di_ud"):] = 0
-    keystroke.iloc[-2, keystroke.columns.get_loc("tri_ud"):] = 0
-    keystroke.fillna(0, inplace=True)
-
+def keystroke_feature_extract(keystroke, key_vocab: dict):
+    hold_time   = (keystroke["release_time"] - keystroke["press_time"]).values / 1000
+    flight_time = np.zeros(len(keystroke), dtype=np.float32)
+    flight_time[:-1] = (keystroke["press_time"].values[1:] - keystroke["release_time"].values[:-1]) / 1000
+    key_code = np.array([key_vocab[k] for k in keystroke["key_code"].values], dtype=np.float32)
+    keystroke["hold_time"]   = hold_time
+    keystroke["flight_time"] = flight_time
+    keystroke["key"]         = key_code
     return keystroke
 
 
@@ -172,45 +165,35 @@ def embed_zero_padding(sequence, target_length):
 def sync_imu_data(acc, gyr, mag, sync_period, imu_sequence_length):
     for name, df in [("accelerometer", acc), ("gyroscope", gyr), ("magnetometer", mag)]:
         if df.isnull().values.any():
-            print(f"WARNING: {name} dataframe contains NaN")
-            df.replace(np.nan, 0, inplace=True)
+            LOGGER.warning("%s dataframe contains NaN", name)
+            df.fillna(0, inplace=True)
 
-    def time_bounds(df):
-        if df.empty:
-            return math.inf, -math.inf
-        return df.iloc[0]["event_time"], df.iloc[-1]["event_time"]
+    start_time   = min(df["event_time"].iloc[0]  for df in (acc, gyr, mag) if not df.empty)
+    highest_time = max(df["event_time"].iloc[-1] for df in (acc, gyr, mag) if not df.empty)
 
-    acc_min, acc_max = time_bounds(acc)
-    gyr_min, gyr_max = time_bounds(gyr)
-    mag_min, mag_max = time_bounds(mag)
+    bins = np.arange(start_time, highest_time + sync_period, sync_period)
+    n_windows = len(bins) - 1
 
-    start_time = min(acc_min, gyr_min, mag_min)
-    highest_time = max(acc_max, gyr_max, mag_max)
+    parts = []
+    prefixes = {"a": acc, "g": gyr, "m": mag}
+    for prefix, df in prefixes.items():
+        labels = pd.cut(df["event_time"], bins=bins, labels=False, right=True)
+        empty_windows = n_windows - labels.dropna().nunique()
+        if empty_windows > 0:
+            LOGGER.warning("%d windows have no IMU elements for sensor %s", empty_windows, prefix)
+        cols = [c for c in IMU_COLUMNS if c in df.columns]
+        part = (
+            df[cols].groupby(labels, observed=False).mean()
+            .reindex(range(n_windows))
+            .fillna(0.0)
+        )
+        part.columns = [f"{prefix}_{c}" for c in cols]
+        parts.append(part)
 
-    rows = []
-    t = start_time
-    while t < highest_time:
-        t_end = t + sync_period
-        slices = {
-            "a": acc.loc[(acc["event_time"] >= t) & (acc["event_time"] <= t_end)],
-            "g": gyr.loc[(gyr["event_time"] >= t) & (gyr["event_time"] <= t_end)],
-            "m": mag.loc[(mag["event_time"] >= t) & (mag["event_time"] <= t_end)],
-        }
-        if any(s.empty for s in slices.values()):
-            print("WARNING: Within sync period there are no elements")
-
-        row = [
-            (slices[p][c].mean() or 0.0)   # NaN → 0.0
-            for p in IMU_PREFIXES
-            for c in IMU_COLUMNS
-        ]
-        rows.append(row)
-        t = t_end
-
-    imu_sequence = pd.DataFrame(rows, columns=IMU_FULL_COLS)
+    imu_sequence = pd.concat(parts, axis=1)[IMU_FULL_COLS]
 
     if len(imu_sequence) > imu_sequence_length:
-        imu_sequence = imu_sequence.head(imu_sequence_length)
+        imu_sequence = imu_sequence.iloc[:imu_sequence_length]
     else:
         imu_sequence = embed_zero_padding(imu_sequence, imu_sequence_length)
 
@@ -257,7 +240,21 @@ def get_users(absolute_path):
     return [d for d in os.listdir(public_dir) if d.isnumeric() and "." not in d]
 
 
-def read_keystroke(absolute_path, users_list):
+def build_key_vocab(absolute_path, users_list) -> dict:
+    """Scan all sessions and return a mapping raw_key_code -> 1-based index (0 reserved for padding)."""
+    public_dir = Path(absolute_path) / "public_dataset"
+    raw_keys = set()
+    for userid in users_list:
+        for session in os.listdir(public_dir / userid):
+            if "." in session:
+                continue
+            ks = pd.read_csv(public_dir / userid / session / "KeyPressEvent.csv",
+                             header=None, usecols=[4], names=["key_code"])
+            raw_keys.update(ks["key_code"].unique())
+    return {k: i + 1 for i, k in enumerate(sorted(raw_keys))}
+
+
+def read_keystroke(absolute_path, users_list, keystroke_sequence_len, imu_sequence_len, windowing_offset, key_vocab: dict):
     public_dir = Path(absolute_path) / "public_dataset"
     all_data = []
 
@@ -277,7 +274,7 @@ def read_keystroke(absolute_path, users_list):
             generate_couple([ks])
             ks.drop(columns=["user_id"], inplace=True)
             ks = shrink_couple_data(ks)       # now returns instead of mutating
-            ks = keystroke_feature_extract(ks)
+            ks = keystroke_feature_extract(ks, key_vocab)
 
             def read_imu(filename):
                 return imu_feature_extract(
@@ -293,15 +290,15 @@ def read_keystroke(absolute_path, users_list):
                                             windowing_offset, acc, gyr, mag)
 
             sequences = [
-                [seq.drop(columns=["press_time", "release_time", "key_code"]).to_numpy(),
+                [seq[["hold_time", "flight_time", "key"]].to_numpy(dtype=np.float32),
                  imu.to_numpy()]
                 for seq, imu in zip(ks_seqs, imu_seqs)
             ]
             session_data.append(sequences)
-            print(f"INFO: Session {session} completed")
+            LOGGER.info("Session %s completed", session)
 
         all_data.append(session_data)
-        print(f"INFO: User {userid} completed ({i}/{len(users_list)})")
+        LOGGER.info("User %s completed (%s/%s)", userid, i, len(users_list))
 
     return all_data
 
@@ -313,23 +310,48 @@ def save_pickle(data, path):
         pickle.dump(data, f)
 
 
+def build_pickles(keystroke_sequence_len: int, imu_sequence_len: int, windowing_offset: int) -> None:
+    """Build and save train/val/test pickles from the raw public_dataset directory."""
+    raw_dir = _PREP_DIR / "public_dataset"
+    if not raw_dir.exists():
+        raise FileNotFoundError(
+            f"Raw dataset not found at {raw_dir}. Run build.py to download and extract it first."
+        )
+
+    users_list = get_users(raw_dir.parent)
+    key_vocab = build_key_vocab(raw_dir.parent, users_list)
+    LOGGER.info("Key vocabulary size: %s", len(key_vocab))
+    save_pickle(key_vocab, _PREP_DIR / "key_vocab.pickle")
+
+    train_users, val_test = train_test_split(users_list, test_size=30, train_size=69, shuffle=True)
+    val_users, test_users = train_test_split(val_test,   test_size=15, train_size=15, shuffle=True)
+
+    for split, users in [("training", train_users), ("validation", val_users), ("testing", test_users)]:
+        save_pickle(
+            read_keystroke(raw_dir.parent, users, keystroke_sequence_len, imu_sequence_len, windowing_offset, key_vocab),
+            _PREP_DIR / f"{split}_keystroke_imu_data_all.pickle",
+        )
+
+
 # ── Entry point ──────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     config_data = Config().get_config_dict()["data"]
 
-    dataset_url           = config_data["hmog"]["dataset_url"]
     keystroke_sequence_len = config_data["keystroke_sequence_len"] or 50
     imu_sequence_len       = config_data["imu_sequence_len"]       or 100
     windowing_offset       = config_data["hmog"]["windowing_offset"] or 5
 
-    download_dataset_file(dataset_url)
-    extract(DOWNLOAD_FILE)
-    get_filtered_users()
-
-    users_list = get_users(DATASET_DIR)
-    train_users, val_test = train_test_split(users_list, test_size=30, train_size=69, shuffle=True)
-    val_users, test_users = train_test_split(val_test,   test_size=15, train_size=15, shuffle=True)
-
-    for split, users in [("training", train_users), ("validation", val_users), ("testing", test_users)]:
-        save_pickle(read_keystroke(DATASET_DIR, users), f"{split}_keystroke_imu_data_all.pickle")
+    pickles = [_PREP_DIR / f"{s}_keystroke_imu_data_all.pickle" for s in ("training", "validation", "testing")]
+    if all(p.exists() for p in pickles):
+        LOGGER.info("All HMOG pickles already exist, skipping build.")
+    else:
+        dataset_url = config_data["hmog"]["dataset_url"]
+        download_dataset_file(dataset_url)
+        extract(DOWNLOAD_FILE)
+        get_filtered_users()
+        build_pickles(
+            keystroke_sequence_len=keystroke_sequence_len,
+            imu_sequence_len=imu_sequence_len,
+            windowing_offset=windowing_offset,
+        )

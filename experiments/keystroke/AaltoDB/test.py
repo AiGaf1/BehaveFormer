@@ -1,3 +1,10 @@
+"""Legacy Aalto evaluation script.
+
+The active training path now uses KeystrokeModel, learnable Fourier timing
+features, and Lightning checkpoints. Update this script before using it for new
+checkpoints.
+"""
+
 import math
 import pickle
 import subprocess

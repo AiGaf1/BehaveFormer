@@ -2,59 +2,44 @@ import json
 import os
 import random
 import warnings
+from dataclasses import dataclass
 from pathlib import Path
-from types import SimpleNamespace
+from typing import Any
 
 import numpy as np
 import pytorch_lightning as pl
 import torch
-from pytorch_lightning.callbacks import ModelCheckpoint
+from pytorch_lightning.callbacks import ModelCheckpoint, ModelSummary
 from pytorch_lightning.loggers import WandbLogger
 from pytorch_metric_learning.losses import SupConLoss
 from torch.utils.data import DataLoader
 
 _CHECKPOINT_DIR_WARNING = r"Checkpoint directory .* exists and is not empty\."
-_DEFAULT_SEED = 42
-_DEFAULT_WEIGHT_DECAY = 0.01
-_DEFAULT_GRADIENT_CLIP_VAL = 1.0
 _VALID_OPTIMIZERS = {"adamw", "muon_hybrid"}
 _VALID_MUON_ADJUST_LR_FNS = {"match_rms_adamw", "original"}
 _VALID_WANDB_WATCH_MODES = {"none", "gradients", "parameters", "all"}
 
 
-def _env(name: str, default, cast=None):
-    raw = os.getenv(name)
-    if raw is None:
-        return default
-    return raw if cast is None else cast(raw)
+@dataclass(frozen=True)
+class RuntimeConfig:
+    seed: int
+    compile_model: bool
+    optimizer: str
+    weight_decay: float
+    gradient_clip_val: float
+    muon_adjust_lr_fn: str
+    muon_momentum: float
+    muon_nesterov: bool
+    muon_ns_steps: int
+    num_workers: int
+    prefetch_factor: int
+    log_every_n_steps: int
+    wandb_enabled: bool
+    wandb_watch: str
+    wandb_watch_freq: int
 
 
-def _env_bool(name: str, default: bool) -> bool:
-    raw = os.getenv(name)
-    if raw is None:
-        return default
-    return raw.strip().lower() not in {"0", "false", "no", "off"}
-
-
-def _choice(name: str, default: str, choices: set[str]) -> str:
-    value = _env(name, default).strip().lower()
-    if value not in choices:
-        valid = ", ".join(sorted(choices))
-        raise ValueError(f"Unsupported {name}={value!r}; expected one of: {valid}")
-    return value
-
-
-def _json_env(name: str, default):
-    raw = os.getenv(name)
-    return json.loads(raw) if raw else default
-
-
-def training_seed() -> int:
-    return _env("BEHAVEFORMER_SEED", _DEFAULT_SEED, int)
-
-
-def seed_training(seed: int | None = None) -> int:
-    seed = training_seed() if seed is None else seed
+def seed_training(seed: int) -> None:
     os.environ["PYTHONHASHSEED"] = str(seed)
     pl.seed_everything(seed, workers=True)
     random.seed(seed)
@@ -63,27 +48,38 @@ def seed_training(seed: int | None = None) -> int:
     torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.benchmark = False
     torch.backends.cudnn.deterministic = True
-    return seed
 
 
-def _runtime_config():
-    wandb_enabled = os.getenv("BEHAVEFORMER_WANDB_ENABLED") == "1"
-    return SimpleNamespace(
-        seed=training_seed(),
-        compile_model=_env_bool("BEHAVEFORMER_TORCH_COMPILE", True),
-        optimizer=_choice("BEHAVEFORMER_OPTIMIZER", "muon_hybrid", _VALID_OPTIMIZERS),
-        weight_decay=_env("BEHAVEFORMER_WEIGHT_DECAY", _DEFAULT_WEIGHT_DECAY, float),
-        gradient_clip_val=_env("BEHAVEFORMER_GRADIENT_CLIP_VAL", _DEFAULT_GRADIENT_CLIP_VAL, float),
-        muon_adjust_lr_fn=_choice("BEHAVEFORMER_MUON_ADJUST_LR_FN", "match_rms_adamw", _VALID_MUON_ADJUST_LR_FNS),
-        muon_momentum=_env("BEHAVEFORMER_MUON_MOMENTUM", 0.95, float),
-        muon_nesterov=_env_bool("BEHAVEFORMER_MUON_NESTEROV", True),
-        muon_ns_steps=_env("BEHAVEFORMER_MUON_NS_STEPS", 5, int),
-        num_workers=_env("BEHAVEFORMER_NUM_WORKERS", max(1, min(8, (os.cpu_count() or 1) - 1)), int),
-        prefetch_factor=_env("BEHAVEFORMER_PREFETCH_FACTOR", 4, int),
-        log_every_n_steps=_env("BEHAVEFORMER_LOG_EVERY_N_STEPS", 50, int),
-        wandb_enabled=wandb_enabled,
-        wandb_watch=_choice("BEHAVEFORMER_WANDB_WATCH", "none", _VALID_WANDB_WATCH_MODES) if wandb_enabled else "none",
-        wandb_watch_freq=_env("BEHAVEFORMER_WANDB_WATCH_FREQ", 100, int) if wandb_enabled else 100,
+def _runtime_config(cfg: dict) -> RuntimeConfig:
+    rt = cfg["runtime"]
+    optimizer = rt["optimizer"]
+    if optimizer not in _VALID_OPTIMIZERS:
+        raise ValueError(f"optimizer={optimizer!r}; expected one of: {', '.join(sorted(_VALID_OPTIMIZERS))}")
+    muon_adjust_lr_fn = rt["muon_adjust_lr_fn"]
+    if muon_adjust_lr_fn not in _VALID_MUON_ADJUST_LR_FNS:
+        raise ValueError(f"muon_adjust_lr_fn={muon_adjust_lr_fn!r}; expected one of: {', '.join(sorted(_VALID_MUON_ADJUST_LR_FNS))}")
+    wandb_watch = rt["wandb_watch"]
+    if wandb_watch not in _VALID_WANDB_WATCH_MODES:
+        raise ValueError(f"wandb_watch={wandb_watch!r}; expected one of: {', '.join(sorted(_VALID_WANDB_WATCH_MODES))}")
+    num_workers = rt["num_workers"]
+    if num_workers < 0:
+        num_workers = max(1, min(8, (os.cpu_count() or 1) - 1))
+    return RuntimeConfig(
+        seed=rt["seed"],
+        compile_model=rt["compile_model"],
+        optimizer=optimizer,
+        weight_decay=rt["weight_decay"],
+        gradient_clip_val=rt["gradient_clip_val"],
+        muon_adjust_lr_fn=muon_adjust_lr_fn,
+        muon_momentum=rt["muon_momentum"],
+        muon_nesterov=rt["muon_nesterov"],
+        muon_ns_steps=rt["muon_ns_steps"],
+        num_workers=num_workers,
+        prefetch_factor=rt["prefetch_factor"],
+        log_every_n_steps=rt["log_every_n_steps"],
+        wandb_enabled=rt["wandb_enabled"],
+        wandb_watch=wandb_watch if rt["wandb_enabled"] else "none",
+        wandb_watch_freq=rt["wandb_watch_freq"],
     )
 
 
@@ -132,7 +128,9 @@ def _build_muon_hybrid(model, learning_rate, config):
     return optimizers[0] if len(optimizers) == 1 else optimizers
 
 
-class _KeystrokeLightningModule(pl.LightningModule):
+class KeystrokeLightningModule(pl.LightningModule):
+    _forward_model: Any
+
     def __init__(
         self,
         model_factory,
@@ -148,7 +146,10 @@ class _KeystrokeLightningModule(pl.LightningModule):
     ):
         super().__init__()
         self.model = model_factory()
-        self._model_runner, self.compile_enabled = _compile_model(self.model, config)
+        forward_model, self.compile_enabled = _compile_model(self.model, config)
+        # Keep the compiled callable out of Lightning's child-module registry;
+        # self.model is the single checkpointed/optimized module.
+        object.__setattr__(self, "_forward_model", forward_model)
         self.automatic_optimization = config.optimizer == "adamw"
 
         self.config = config
@@ -167,21 +168,21 @@ class _KeystrokeLightningModule(pl.LightningModule):
 
     def training_step(self, batch, _):
         sequences, labels = batch
-        embeddings = self._model_runner(sequences)
+        embeddings = self._forward_model(sequences)
         loss = self.loss_fn(embeddings, labels)
 
         if not self.automatic_optimization:
             self._step_optimizers(loss)
 
-        self.log("train_loss", loss, on_step=False, on_epoch=True, prog_bar=True, logger=True, batch_size=len(labels))
+        self.log("train_loss", loss, on_step=False, on_epoch=True, prog_bar=True, logger=self.logger is not None, batch_size=len(labels))
         return loss
 
     def _step_optimizers(self, loss):
-        optimizers = self.optimizers()
+        optimizers = self.optimizers(use_pl_optimizer=False)
         optimizers = optimizers if isinstance(optimizers, (list, tuple)) else [optimizers]
 
         for optimizer in optimizers:
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=True)
         self.manual_backward(loss)
 
         if self.config.gradient_clip_val:
@@ -199,31 +200,32 @@ class _KeystrokeLightningModule(pl.LightningModule):
         self.validation_embeddings = []
 
     def validation_step(self, batch, _):
-        self.validation_embeddings.append(self._model_runner(batch).detach())
+        self.validation_embeddings.append(self._forward_model(batch).detach())
 
     def on_validation_epoch_end(self):
         val_embeddings = torch.cat(self.validation_embeddings, dim=0)
         eer = self.compute_val_eer(val_embeddings)
-        self.log("val_eer", eer, on_step=False, on_epoch=True, prog_bar=True, logger=True)
+        has_logger = self.logger is not None
+        self.log("val_eer", eer, on_step=False, on_epoch=True, prog_bar=True, logger=has_logger)
 
         if (self.current_epoch + 1) % self.metrics_every_n_epochs != 0:
             return
 
         if self.compute_val_metrics is not None:
             metrics = {f"val_{key}": value for key, value in self.compute_val_metrics(val_embeddings).items() if key != "eer"}
-            self.log_dict(metrics, on_epoch=True, logger=True)
+            self.log_dict(metrics, on_epoch=True, logger=has_logger)
 
         if self.compute_train_metrics is not None and self.train_eval_loader is not None:
             train_embeddings = self._collect_embeddings(self.train_eval_loader)
             metrics = {f"train_{key}": value for key, value in self.compute_train_metrics(train_embeddings).items()}
-            self.log_dict(metrics, on_epoch=True, logger=True)
+            self.log_dict(metrics, on_epoch=True, logger=has_logger)
 
     @torch.no_grad()
     def _collect_embeddings(self, loader):
         was_training = self.model.training
         self.model.eval()
         try:
-            embeddings = [self._model_runner(batch.to(self.device)).detach() for batch in loader]
+            embeddings = [self._forward_model(batch.to(self.device)).detach() for batch in loader]
             return torch.cat(embeddings, dim=0)
         finally:
             self.model.train(was_training)
@@ -234,26 +236,26 @@ class _KeystrokeLightningModule(pl.LightningModule):
         return _build_muon_hybrid(self.model, self.learning_rate, self.config)
 
 
-def _setup_wandb(project_root: Path, module: _KeystrokeLightningModule):
+def _setup_wandb(project_root: Path, module: KeystrokeLightningModule, rt: dict):
     config = module.config
     if not config.wandb_enabled:
         return None
     if config.wandb_watch != "none" and module.compile_enabled:
         raise RuntimeError(
-            "BEHAVEFORMER_WANDB_WATCH requires eager execution. "
-            "Re-run with BEHAVEFORMER_TORCH_COMPILE=0 to enable W&B watch safely."
+            "wandb_watch requires eager execution. "
+            "Set compile_model=false in config.json to enable W&B watch safely."
         )
 
     logger = WandbLogger(
-        project=os.getenv("BEHAVEFORMER_WANDB_PROJECT") or "BehaveFormer",
-        entity=os.getenv("BEHAVEFORMER_WANDB_ENTITY") or None,
-        name=os.getenv("BEHAVEFORMER_WANDB_RUN_NAME") or None,
-        version=os.getenv("BEHAVEFORMER_WANDB_RUN_ID") or None,
-        tags=_json_env("BEHAVEFORMER_WANDB_TAGS_JSON", []),
+        project=rt.get("wandb_project") or "BehaveFormer",
+        entity=rt.get("wandb_entity") or None,
+        name=rt.get("wandb_run_name") or None,
+        version=rt.get("wandb_run_id") or None,
+        tags=rt.get("wandb_tags") or [],
         log_model=False,
         save_dir=str(project_root),
     )
-    logger.experiment.config.update(_json_env("BEHAVEFORMER_WANDB_CONFIG_JSON", {}), allow_val_change=True)
+    logger.experiment.config.update(rt.get("wandb_config") or {}, allow_val_change=True)
     logger.experiment.config.update(
         {
             "model_class_name": module.model.__class__.__name__,
@@ -321,7 +323,8 @@ def run_keystroke_training(
     warnings.filterwarnings("ignore", message=_CHECKPOINT_DIR_WARNING, category=UserWarning)
     torch.set_float32_matmul_precision("high")
 
-    config = _runtime_config()
+    project_cfg = json.loads((Path(project_root) / "config.json").read_text())
+    config = _runtime_config(project_cfg)
     seed_training(config.seed)
     train_loader = DataLoader(train_dataset, shuffle=False, **_loader_kwargs(batch_size, config, seed_offset=0))
     val_loader = DataLoader(val_dataset, **_loader_kwargs(batch_size, config, seed_offset=1))
@@ -331,7 +334,7 @@ def run_keystroke_training(
         else None
     )
 
-    module = _KeystrokeLightningModule(
+    module = KeystrokeLightningModule(
         model_factory,
         learning_rate,
         compute_val_eer,
@@ -352,6 +355,11 @@ def run_keystroke_training(
         auto_insert_metric_name=False,
     )
 
+    rt = project_cfg["runtime"]
+    callbacks: list[pl.Callback] = [best_ckpt]
+    if rt.get("model_summary", False):
+        callbacks.append(ModelSummary(max_depth=rt.get("model_summary_depth", 3)))
+
     trainer_kwargs = {}
     if config.optimizer == "adamw" and config.gradient_clip_val:
         trainer_kwargs["gradient_clip_val"] = config.gradient_clip_val
@@ -360,8 +368,8 @@ def run_keystroke_training(
         accelerator="gpu",
         devices=1,
         max_epochs=epochs,
-        callbacks=[best_ckpt],
-        logger=_setup_wandb(Path(project_root), module) or False,
+        callbacks=callbacks,
+        logger=_setup_wandb(Path(project_root), module, project_cfg["runtime"]) or False,
         log_every_n_steps=max(1, min(config.log_every_n_steps, max(1, len(train_loader)))),
         enable_model_summary=False,
         num_sanity_val_steps=0,

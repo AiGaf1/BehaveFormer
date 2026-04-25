@@ -53,7 +53,8 @@ def resolve_script(args):
     dataset = DATASETS[args.dataset]
 
     if args.model is None:
-        return ROOT / "data" / dataset / f"{args.mode}.py"
+        script_name = "build" if args.mode == "preprocess" else args.mode
+        return ROOT / "data" / dataset / f"{script_name}.py"
 
     base = EXPERIMENTS[args.model]
 

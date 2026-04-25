@@ -11,7 +11,6 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
-from experiments.common.datasets import scale_features
 from experiments.common.loss import TripletLoss
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -27,8 +26,6 @@ TRAINING_PICKLE   = "training_keystroke_imu_data_all.pickle"
 VALIDATION_PICKLE = "validation_keystroke_imu_data_all.pickle"
 TESTING_PICKLE    = "testing_keystroke_imu_data_all.pickle"
 
-HMOG_KEYSTROKE_SCALE_MAP = {i: 1000 for i in range(9)}
-HMOG_KEYSTROKE_SCALE_MAP[9] = 255
 HMOG_IMU_SCALE_MAP = {
     0: 10, 1: 10, 2: 10,
     3: 1000, 4: 1000, 5: 1000, 15: 1000, 16: 1000, 17: 1000,
@@ -36,7 +33,6 @@ HMOG_IMU_SCALE_MAP = {
     27: 10000, 28: 10000, 29: 10000,
 }
 
-HUMI_KEYSTROKE_SCALE_MAP = {1: 1000, 2: 1000, 3: 255}
 HUMI_IMU_SCALE_MAP = {
     0: 10, 1: 10, 2: 10,
     3: 1000, 4: 1000, 5: 1000,
@@ -44,6 +40,16 @@ HUMI_IMU_SCALE_MAP = {
     24: 1000, 25: 1000, 26: 1000,
     27: 1000, 28: 1000, 29: 1000,
 }
+
+
+def _scale_imu_features(data, imu_scale_map):
+    for user in data:
+        for session in user:
+            for i, sequence in enumerate(session):
+                imu = sequence[1].astype(np.float64, copy=True)
+                for col, divisor in imu_scale_map.items():
+                    imu[:, col] /= divisor
+                session[i][1] = imu
 
 
 @dataclass(frozen=True)
@@ -125,9 +131,10 @@ def _collate_eval(batch):
 @torch.no_grad()
 def _evaluate(model, data, batch_size, trg_len, n_enroll, n_verify, dataset_key, imu_columns, device):
     model.eval()
-    loader = DataLoader(_EvalDataset(data, imu_columns), batch_size=batch_size, collate_fn=_collate_eval)
+    dataset = _EvalDataset(data, imu_columns)
+    loader = DataLoader(dataset, batch_size=batch_size, collate_fn=_collate_eval)
     embeddings = torch.cat([model([b[0].to(device), b[1].to(device)]) for b in loader])
-    n_users, n_sessions, n_seqs = len(data), loader.dataset.n_sessions, loader.dataset.n_seqs
+    n_users, n_sessions, n_seqs = len(data), dataset.n_sessions, dataset.n_seqs
     return Metric.cal_user_eer(embeddings.view(n_users, n_sessions, n_seqs, trg_len), n_enroll, n_verify, dataset_key)[0]
 
 
@@ -153,15 +160,14 @@ def run_combined_training(*, spec: CombinedSpec, dataset_dir_name: str, model_fa
     with open(val_path, "rb") as f:
         validation_data = pickle.load(f)
 
-    ks_map  = HMOG_KEYSTROKE_SCALE_MAP if spec.dataset_key == "hmog" else HUMI_KEYSTROKE_SCALE_MAP
     imu_map = HMOG_IMU_SCALE_MAP       if spec.dataset_key == "hmog" else HUMI_IMU_SCALE_MAP
     val_limit = 50 if spec.dataset_key == "hmog" else 1
     for user in validation_data:
         for idx, session in enumerate(user):
             user[idx] = session[:val_limit]
 
-    scale_features(training_data,   ks_map, imu_map)
-    scale_features(validation_data, ks_map, imu_map)
+    _scale_imu_features(training_data,   imu_map)
+    _scale_imu_features(validation_data, imu_map)
 
     batch_size        = hp["batch_size"][spec.dataset_key]
     epoch_batch_count = hp["epoch_batch_count"][spec.dataset_key]
