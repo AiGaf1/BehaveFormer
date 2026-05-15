@@ -1,162 +1,37 @@
-import os
-import re
-import subprocess
-from datetime import datetime
-from importlib import import_module
 from pathlib import Path
-from typing import Iterable
 
-from utils.Config import Config
-
-_DATASET_HPARAMS = (
-    "batch_size",
-    "epoch_batch_count",
-    "keystroke_feature_count",
-    "number_of_enrollment_sessions",
-    "number_of_verify_sessions",
-)
-
-_EPOCH_RE = re.compile(
-    r"Epoch No:\s*(?P<epoch>\d+)\s*-\s*Loss:\s*(?P<loss>[-+]?\d*\.?\d+)"
-    r"\s*-\s*EER:\s*(?P<eer>[-+]?\d*\.?\d+)\s*-\s*Time:\s*(?P<time>[-+]?\d*\.?\d+)"
-)
+from pytorch_lightning.loggers import WandbLogger
 
 
-def load_env_file(env_path: Path | str = ".env") -> None:
-    env_file = Path(env_path)
-    if not env_file.exists():
-        return
-    for line in env_file.read_text().splitlines():
-        line = line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, value = line.split("=", 1)
-        os.environ.setdefault(key.strip(), value.strip().strip("'\""))
-
-
-def build_run_name(args) -> str:
-    model_names = {
-        "keystroke": "k",
-        "keystroke_imu": "k_imu",
-        "tl": "tl",
-    }
-    model = model_names.get(args.model, args.model)
-    return "-".join(part for part in [args.dataset, model, args.mode, args.imu] if part)
-
-
-def build_run_id() -> str:
-    return datetime.now().strftime("%Y%m%d-%H%M%S")
-
-
-
-def build_config(args) -> dict:
-    project_config = Config().get_config_dict()
-    data_config = project_config["data"]
-    hyperparams = project_config["hyperparams"]
-    resuming = args.mode == "continue_train" and args.initepoch
-    checkpoint_dir = Path(args.script).resolve().parent / "checkpoints"
-
-    config = {
-        "dataset": args.dataset,
-        "model": args.model,
-        "mode": args.mode,
-        "imu": args.imu,
-        "metric": args.metric,
-        "epochs": _maybe_int(args.epochs),
-        "init_epoch": _maybe_int(args.initepoch),
-        "testfile": args.testfile,
-        "script": str(args.script),
-        "gpu": project_config["GPU"],
-        "learning_rate": hyperparams["learning_rate"],
-        "target_len": hyperparams["target_len"],
-        "key_embedding_dim": hyperparams.get("key_embedding_dim"),
-        "embedded_keystroke_model_dim": hyperparams.get("embedded_keystroke_model_dim"),
-        "keystroke_sequence_len": data_config["keystroke_sequence_len"],
-        "resume_from_epoch": _maybe_int(args.initepoch) if resuming else None,
-        "resume_from_checkpoint_tar": str(checkpoint_dir / f"training_{args.initepoch}.tar") if resuming else None,
-        "resume_from_checkpoint_ckpt": str(checkpoint_dir / f"training_{args.initepoch}.ckpt") if resuming else None,
-    }
-
-    if args.dataset:
-        config |= {name: hyperparams[name].get(args.dataset) for name in _DATASET_HPARAMS}
-        dataset_config = data_config.get(args.dataset)
-        if isinstance(dataset_config, dict):
-            config["windowing_offset"] = dataset_config.get("windowing_offset")
-
-    if args.imu:
-        imu_key = "all" if args.imu == "all" else ("two_types" if "_" in args.imu else "one_type")
-        config["imu_sequence_len"] = data_config["imu_sequence_len"]
-        config["imu_feature_count"] = hyperparams["imu_feature_count"][imu_key]
-
-    return {k: v for k, v in config.items() if v is not None}
-
-
-def init_run(
-    enabled: bool,
-    project: str,
-    config: dict,
-    run_name: str,
-    run_id: str | None = None,
-    tags: Iterable[str] | None = None,
-    entity: str | None = None,
-):
-    if not enabled:
+def setup_lightning_wandb(project_root: Path, module, rt: dict):
+    config = module.config
+    if not config.wandb_enabled:
         return None
-    load_env_file()
-    return import_module("wandb").init(
-        project=project,
-        entity=entity,
-        config=config,
-        name=run_name,
-        id=run_id,
-        tags=list(tags or []),
-        save_code=True,
+
+    logger = WandbLogger(
+        project=rt.get("wandb_project") or "BehaveFormer",
+        entity=rt.get("wandb_entity") or None,
+        name=rt.get("wandb_run_name") or None,
+        version=rt.get("wandb_run_id") or None,
+        tags=rt.get("wandb_tags") or [],
+        log_model="all",
+        save_dir=str(project_root),
     )
-
-
-def stream_subprocess(
-    command: list[str],
-    cwd: Path,
-    run=None,
-    env: dict | None = None,
-    passthrough_output: bool = False,
-) -> int:
-    if passthrough_output:
-        return subprocess.Popen(command, cwd=cwd, env=env).wait()
-
-    process = subprocess.Popen(
-        command,
-        cwd=cwd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        bufsize=1,
-        env=env,
+    logger.experiment.config.update(rt.get("wandb_config") or {}, allow_val_change=True)
+    logger.experiment.config.update(
+        {
+            "module_class_name":         module.__class__.__name__,
+            "model_parameter_count":     sum(p.numel() for p in module.parameters()),
+            "trainable_parameter_count": sum(p.numel() for p in module.parameters() if p.requires_grad),
+            "torch_compile_enabled":     True,
+            "optimizer_name":            config.optimizer,
+            "weight_decay":              config.weight_decay,
+            "muon_adjust_lr_fn":         config.muon_adjust_lr_fn,
+            "muon_momentum":             config.muon_momentum,
+            "muon_nesterov":             config.muon_nesterov,
+            "muon_ns_steps":             config.muon_ns_steps,
+        },
+        allow_val_change=True,
     )
-    for line in process.stdout or []:
-        print(line, end="")
-        if run is not None:
-            metrics = parse_metrics(line)
-            if metrics:
-                run.log(metrics, step=metrics["epoch"])
-
-    return process.wait()
-
-
-def parse_metrics(line: str) -> dict | None:
-    match = _EPOCH_RE.search(line)
-    if not match:
-        return None
-    return {
-        "epoch": int(match.group("epoch")),
-        "train/loss": float(match.group("loss")),
-        "val/eer": float(match.group("eer")),
-        "epoch_time_seconds": float(match.group("time")),
-    }
-
-
-def _maybe_int(value: str | None) -> int | None:
-    try:
-        return int(value) if value is not None else None
-    except ValueError:
-        return None
+    logger.watch(module, log="all", log_freq=config.wandb_watch_freq, log_graph=True)
+    return logger

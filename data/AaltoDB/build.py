@@ -6,7 +6,7 @@ from pathlib import Path
 import pandas as pd
 
 sys.path.append(str(Path(__file__).resolve().parents[2] / "utils"))
-from Config import Config
+from config import Config
 
 _HERE = Path(__file__).resolve().parent
 _CSV  = _HERE / "prep_data" / "keystroke_data.csv"

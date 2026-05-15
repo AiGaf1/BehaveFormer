@@ -34,9 +34,8 @@ dev = [
     "ruff==0.15.10",
 ]
 
-[tool.setuptools]
-packages = []
-py-modules = []
+[tool.setuptools.packages.find]
+exclude = ["wandb*", "data/*/raw*", "outputs*"]
 
 [tool.black]
 line-length = 150
