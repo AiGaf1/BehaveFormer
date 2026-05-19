@@ -36,3 +36,4 @@ def encode_windows(
         x = batch[0] if isinstance(batch, (tuple, list)) else batch
         embs.append(encoder(x.to(device)).cpu())
     return torch.cat(embs, dim=0)
+Y
