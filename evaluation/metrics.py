@@ -6,7 +6,6 @@ import torch
 from utils.logger import get_logger
 
 LOGGER = get_logger(__name__)
-_N_THRESHOLDS = 500
 
 
 class Metric:
@@ -140,7 +139,7 @@ class Metric:
         score_fn: Callable[[dict], torch.Tensor],
         test_streams: list,
         single_streams: list,
-        n_thresholds: int = _N_THRESHOLDS,
+        n_thresholds: int = 500,
     ) -> dict:
         """
         Evaluate a CA scoring function on the test split.
@@ -161,6 +160,10 @@ class Metric:
             ptcr:      fraction of attack streams detected   (per-stream)
             edd:       expected impostor keystrokes leaked   (keystrokes)
                        — averaged over ALL attacks; undetected → len(events) - t*.
+            wdd:       Average Detection Delay (ADD) in windows, anchored at the first
+                       window containing the impostor (boundary = max(0, t*-L+1)).
+                       d=0 means detection at the boundary; averaged over DETECTED
+                       attacks only (misses excluded — see ptcr for the detection rate).
             usability: fraction of pre-attack windows correctly silent
                        — per-window (≈ per-keystroke with stride-1, off-by-(L-1)
                        at the boundary).
@@ -175,9 +178,7 @@ class Metric:
         same_user_streams = [s for s in test_streams if s["stream_type"] == "same_user"]
         all_test          = attack_streams + same_user_streams
 
-        LOGGER.info(f"Scoring {len(attack_streams)} attack + {len(same_user_streams)} same-user streams")
         scored      = {id(s): score_fn(s) for s in all_test}
-        LOGGER.info(f"Scoring {len(single_streams)} single-session streams")
         scored_sing = {id(s): score_fn(s) for s in single_streams}
 
         def _seq_len(s, p):
@@ -235,6 +236,20 @@ class Metric:
             else:
                 edd_vals.append(n_events - s["t_star"])
 
+        # WDD = Average Detection Delay (ADD) anchored at the first window that
+        # contains the impostor (boundary = max(0, t* - L + 1)).
+        # Averaged over DETECTED attacks only — misses are counted by PTCR, not here.
+        # d = offset from boundary to the first p_t >= tau_op window (0 = instant).
+        wdd_vals = []
+        for s in attack_streams:
+            p_t = scored[id(s)]
+            L = _seq_len(s, p_t)
+            if L is None:
+                continue
+            d = Metric._detection_delay(p_t, s["t_star"], L, tau_op)
+            if d is not None:
+                wdd_vals.append(d)
+
         # Op.FPR: macro-FPR over genuine streams = singles + same-user suffix
         # (the part of same-user streams not measured by Usability).
         fpr_vals = [Metric._stream_fpr(scored_sing[id(s)], tau_op) for s in single_streams]
@@ -252,6 +267,7 @@ class Metric:
             "ausc":      ausc,
             "ptcr":      ptcrs[op_idx],
             "edd":       float(np.mean(edd_vals)) if edd_vals else float("nan"),
+            "wdd":       float(np.mean(wdd_vals)) if wdd_vals else float("nan"),
             "usability": usabilities[op_idx],
             "op_fpr":    float(np.mean(fpr_vals)) if fpr_vals else float("nan"),
             "tau_op":    tau_op,
@@ -261,7 +277,8 @@ class Metric:
     def print_results(results: dict, label: str = "Method") -> None:
         LOGGER.info(
             f"{label}  |  AUSC={results['ausc']:.4f}  PTCR={results['ptcr']:.4f}  "
-            f"EDD={results['edd']:.1f}kstrokes  Usability={results['usability']:.4f}  "
+            f"EDD={results['edd']:.1f}ks  WDD={results.get('wdd', float('nan')):.1f}ks  "
+            f"Usability={results['usability']:.4f}  "
             f"Op.FPR={results['op_fpr']:.4f}  τ_op={results['tau_op']:.4f}"
         )
 

@@ -40,18 +40,21 @@ from app.inference import (
     keystrokes_to_features,
     save_bank,
 )
+from app.keystrokes import event_key_name, key_code
 
 # Keystrokes needed to fill one detector window (must match the model's seq_len).
 SEQ_LEN          = 25
-# Bank size: how many enrollment windows to keep. Trained with K=5; bumping to 10
-# at inference uses the same attention path but gives a more stable target representation.
-BANK_K           = 10
+# Bank size: matches training (K=5) so sim_std / lme feature distributions match
+# what the detector's linear score layer saw during training.
+BANK_K           = 5
 # Multi-session enrollment: K windows are distributed across this many independent
 # sessions (mirrors training's build_raw_banks(multi_session=True)).
 ENROLL_SESSIONS  = 5
-# Each session needs ≥ 2·seq_len keys so `_nonoverlap_starts` can pick two non-overlapping
-# windows when BANK_K // ENROLL_SESSIONS = 2.
-MIN_PER_SESSION  = 2 * SEQ_LEN
+# With BANK_K // ENROLL_SESSIONS = 1, one window per session is enough.
+MIN_PER_SESSION  = SEQ_LEN
+# Self-calibration: keystrokes of genuine typing scored against the user's own bank
+# right after enrollment, used as the *real* genuine distribution for threshold τ.
+VERIFY_KEYS      = 200
 
 
 @dataclass(frozen=True)
@@ -62,8 +65,9 @@ class KeystrokeRow:
 
 
 class KeyboardAuthApp:
-    def __init__(self, root: tk.Tk):
+    def __init__(self, root: tk.Tk, debug_log: bool = False):
         self.root = root
+        self._debug_log = debug_log
         self.root.title("Keyboard Authentication")
         self.root.geometry("980x680")
         self.root.minsize(820, 560)
@@ -84,6 +88,9 @@ class KeyboardAuthApp:
         self._threshold: float = 0.5
         # Multi-session enrollment: feature arrays for each completed session.
         self._enrollment_sessions: list[np.ndarray] = []
+        # Verify-mode state: the just-saved bank waiting for self-calibration.
+        self._verify_bank_path: Path | None = None
+        self._verify_bank_windows: np.ndarray | None = None
 
         self._configure_style()
         self._build_layout()
@@ -145,6 +152,12 @@ class KeyboardAuthApp:
         self.probability_scores = ttk.Label(self.probability_panel, text="—", style="Subtle.TLabel")
         self.probability_scores.grid(row=3, column=0, sticky="w", pady=(4, 0))
 
+        # Diagnostic line: windows scored + recent p_t distribution. Helps tell
+        # whether a wrong authentication outcome is from drift, bank quality, or
+        # threshold calibration. See docs note in _update_live_score.
+        self.probability_debug = ttk.Label(self.probability_panel, text="", style="Subtle.TLabel")
+        self.probability_debug.grid(row=3, column=0, sticky="e", pady=(4, 0))
+
         plot_frame = ttk.Frame(self.probability_panel, style="Panel.TFrame")
         plot_frame.grid(row=4, column=0, sticky="nsew", pady=(16, 0))
         plot_frame.columnconfigure(0, weight=1)
@@ -163,6 +176,10 @@ class KeyboardAuthApp:
         self.probability_ax.grid(True, color="#334155", alpha=0.35, linewidth=0.8)
         self.probability_line, = self.probability_ax.plot([], [], color="#38bdf8", linewidth=2.4)
         self.probability_fill = None
+        self.tau_line = self.probability_ax.axhline(
+            self._threshold, color="#f87171", linewidth=1.4, linestyle="--", alpha=0.85,
+        )
+        self.tau_line.set_visible(False)
 
         self.probability_canvas = FigureCanvasTkAgg(self.probability_figure, master=plot_frame)
         canvas_widget = self.probability_canvas.get_tk_widget()
@@ -255,8 +272,7 @@ class KeyboardAuthApp:
         self.empty_label.grid(row=0, column=0)
         self.empty_label.lift(self.tree)
 
-    def set_probability(self, probability: float, threshold: float | None = None,
-                        last_window: float | None = None) -> None:
+    def set_probability(self, probability: float, threshold: float | None = None) -> None:
         threshold = self._threshold if threshold is None else threshold
         probability = max(0.0, min(1.0, float(probability)))
         self._probability_history.append(probability)
@@ -265,6 +281,12 @@ class KeyboardAuthApp:
         x_values = list(range(len(y_values)))
         self.probability_line.set_data(x_values, y_values)
         self.probability_ax.set_xlim(0, max(1, len(y_values) - 1))
+        engine = getattr(self, "engine", None)
+        if engine is not None and engine.has_bank:
+            self.tau_line.set_ydata([threshold, threshold])
+            self.tau_line.set_visible(True)
+        else:
+            self.tau_line.set_visible(False)
         self.probability_ax.figure.canvas.draw_idle()
 
         if probability >= threshold:
@@ -277,13 +299,7 @@ class KeyboardAuthApp:
         self.probability_status.configure(text=status_text)
         ttk.Style(self.root).configure("Status.TLabel", foreground=status_color)
 
-        # Show momentary (last window) alongside cumulative — last window is the raw
-        # detector output for the most recent seq_len keys (no GRU history), while
-        # cumulative is the GRU-integrated score over the whole stream.
-        last_str = "—" if last_window is None else f"{last_window:.3f}"
-        self.probability_scores.configure(
-            text=f"Last window: {last_str}  ·  Cumulative: {probability:.3f}"
-        )
+        self.probability_scores.configure(text=f"Cumulative score: {probability:.3f}")
     def set_keystrokes(self, rows: Iterable[KeystrokeRow | tuple[str, float, float]]) -> None:
         for item in self.tree.get_children():
             self.tree.delete(item)
@@ -306,22 +322,15 @@ class KeyboardAuthApp:
         self._capture_started = True
         return None
 
-    def _event_key_name(self, event: tk.Event) -> str:
-        if event.keysym == "space":
-            return "Space"
-        if len(event.char) == 1 and event.char.isprintable() and event.char != "\x00":
-            return event.char
-        return event.keysym
-
     def _on_key_press(self, event: tk.Event) -> str | None:
-        key = self._event_key_name(event)
+        key = event_key_name(event)
         now = time.perf_counter()
         if key not in self._pressed_at:
             self._pressed_at[key] = now
         return None
 
     def _on_key_release(self, event: tk.Event) -> str | None:
-        key = self._event_key_name(event)
+        key = event_key_name(event)
         now = time.perf_counter()
         start = self._pressed_at.pop(key, None)
         if start is None:
@@ -336,7 +345,7 @@ class KeyboardAuthApp:
         # consistency between enroll and score is what matters, not the dataset's codes.
         self._press_ms.append(start * 1000.0)
         self._release_ms.append(now * 1000.0)
-        self._key_ids.append(self._key_code(key))
+        self._key_ids.append(key_code(key))
 
         self.tree.insert("", "end", values=(key, f"{hold_time:.1f}", f"{flight_time:.1f}"))
         self.empty_label.grid_remove()
@@ -344,19 +353,6 @@ class KeyboardAuthApp:
         self._update_live_score()
         self._update_counter()
         return None
-
-    @staticmethod
-    def _key_code(key: str) -> int:
-        """Map a key name to an integer code matching the Aalto training data.
-
-        Aalto was collected on Windows with VK codes: letters are uppercase
-        VK_A=65..VK_Z=90, digits VK_0=48..VK_9=57, layout-independent.
-        We mirror that by uppercasing single chars so 'a' and 'A' both → 65.
-        Non-printable keys (shift, ctrl, …) get a stable hash in 128–230.
-        """
-        if len(key) == 1:
-            return ord(key.upper())
-        return hash(key) % 103 + 128  # non-printable: stable, outside letter range
 
     # ── model integration ────────────────────────────────────────────────────
 
@@ -370,8 +366,13 @@ class KeyboardAuthApp:
             return
 
         if self.engine.load_bank():
-            self.engine_status.configure(
-                text=f"Model ready · user loaded from {BANK_PATH.name} · click 'Start auth' to score")
+            npz = np.load(BANK_PATH)
+            if "cal_tau" in npz.files:
+                self.engine_status.configure(
+                    text=f"Model ready · user loaded from {BANK_PATH.name} · click 'Start auth' to score")
+            else:
+                self.engine_status.configure(
+                    text=f"Model ready · {BANK_PATH.name} loaded (no calibration — 'Start auth' will calibrate automatically)")
         else:
             self.engine_status.configure(
                 text="Model ready · no user loaded — 'Load user' or 'Save enrollment' to enrol one")
@@ -395,29 +396,80 @@ class KeyboardAuthApp:
                     text=f"Session {done + 1} / {ENROLL_SESSIONS}  ·  "
                          f"Keys: {n} / {MIN_PER_SESSION}"
                 )
+        elif self._mode == "verify":
+            self.counter_label.configure(
+                text=f"Verification (genuine typing)  ·  Keys: {n} / {VERIFY_KEYS}"
+            )
         else:
             self.counter_label.configure(text=f"Keys typed: {n}")
+
+    @staticmethod
+    def _threshold_from_cal(cal: dict) -> float:
+        """Pick the auth threshold from a calibration dict, in raw-p_t space.
+
+        Prefers z-norm (μ + z·σ) when available — transfers across users.
+        Falls back to the legacy `tau` (per-bank EER/τ_op).
+        """
+        sigma = cal.get("znorm_sigma")
+        mu = cal.get("znorm_mu")
+        if sigma is not None and mu is not None and float(sigma) > 0:
+            z = float(cal.get("z_threshold", 3.0))
+            return float(mu) + z * float(sigma)
+        return float(cal["tau"])
+
+    @classmethod
+    def _format_cal_label(cls, cal: dict, mode: str) -> str:
+        """Render the calibration line. Shows z-norm fields when present."""
+        thr = cls._threshold_from_cal(cal)
+        head = f"τ_eff = {thr:.3f}"
+        sigma = cal.get("znorm_sigma")
+        mu = cal.get("znorm_mu")
+        if sigma is not None and mu is not None and float(sigma) > 0:
+            z = float(cal.get("z_threshold", 3.0))
+            head += f"  (z={z:.1f}  μ={float(mu):.3f}  σ={float(sigma):.3f})"
+        else:
+            head += f"  (τ_op={float(cal['tau']):.3f})"
+        return (f"{head}  |  AUSC {cal['ausc']:.3f}  PTCR {cal['ptcr']*100:.1f}%  "
+                f"Usability {cal['usability']*100:.1f}%  EER {cal['eer']*100:.1f}%  ({mode})")
 
     def _update_live_score(self) -> None:
         """Score the full stream and update the probability panel (auth mode only).
 
-        Cumulative (plot, alarm): engine.score() runs the detector over all windows
-        so the GRU integrates history → "is this session impostor".
-        Last window (momentary): engine.score_latest() runs the detector on just the
-        last seq_len keys with fresh GRU state → "is the latest burst suspicious".
+        engine.score() runs the full detector (encoder + CUSUM accumulator) over all
+        windows so history is integrated. scores[-1] is the latest window's p_t.
+
+        The diagnostic line reports (n_windows, min/mean/max of last 20 p_t). If the
+        curve climbs steadily during genuine typing, the accumulator is drifting; if
+        it stays high but flat, the bank is unrepresentative; if it looks fine but
+        auth still fails, the threshold τ is wrong.
         """
-        if self.engine is None or self._mode != "auth" or not self.engine.has_bank:
+        if (self.engine is None or self._mode not in ("auth", "verify")
+                or not self.engine.has_bank):
             return
         feats = self._current_features()
         if feats is None:
             return
         scores = self.engine.score(feats)
-        if len(scores) > 0:
-            last = self.engine.score_latest(feats)
-            self.set_probability(float(scores[-1]), last_window=last)
+        if len(scores) == 0:
+            return
+        self.set_probability(float(scores[-1]))
+
+        recent = scores[-20:] if len(scores) >= 20 else scores
+        if self._debug_log:
+            sys.stderr.write(
+                f"[p_t] n_windows={len(scores)} latest={scores[-1]:.4f} "
+                f"recent_mean={float(recent.mean()):.4f} "
+                f"min={float(recent.min()):.4f} max={float(recent.max()):.4f}\n"
+            )
+        self.probability_debug.configure(
+            text=(f"n_w={len(scores)}  "
+                  f"recent: min={float(recent.min()):.2f} "
+                  f"mean={float(recent.mean()):.2f} "
+                  f"max={float(recent.max()):.2f}")
+        )
 
     def _start_auth(self) -> None:
-        """Pick a bank file, load it, calibrate τ vs Aalto impostors, enter auth mode."""
+        """Pick a bank file, load saved τ if present (else live-calibrate), enter auth."""
         if self.engine is None:
             return
         path = filedialog.askopenfilename(
@@ -428,31 +480,40 @@ class KeyboardAuthApp:
         if not path:
             return
         try:
-            self.engine.load_bank(Path(path))
+            bank_npz = np.load(path)
+            self.engine.set_bank_from_windows(bank_npz["windows"])
         except Exception as exc:  # noqa: BLE001
             self.engine_status.configure(text=f"Failed to load bank: {exc}")
             return
 
-        # Calibrate the decision threshold against this specific bank.
-        # ~15s on GPU; show status and force a redraw so the user isn't staring at a frozen UI.
-        self.engine_status.configure(text=f"Calibrating threshold for {Path(path).name} …")
-        self.root.update_idletasks()
-        try:
-            bank_raw = np.load(path)["windows"]
-            cal = calibrate_threshold(self.engine, bank_raw, n_users=20)
-            self._threshold = cal["tau"]
-            self.threshold_label.configure(
-                text=f"τ = {cal['tau']:.3f}  |  "
-                     f"AUSC {cal['ausc']:.3f}  "
-                     f"PTCR {cal['ptcr']*100:.1f}%  "
-                     f"Usability {cal['usability']*100:.1f}%  "
-                     f"EER {cal['eer']*100:.1f}%")
+        n_windows = bank_npz["windows"].shape[0]
+        if n_windows < 5:
+            self.engine_status.configure(
+                text=f"Warning: bank has only {n_windows} windows (< 5) — accuracy may be reduced. Re-enrol with more typing."
+            )
+            self.root.update_idletasks()
+
+        if "cal_tau" in bank_npz.files:
+            # Fast path: trust the calibration saved at enrollment time.
+            cal = {k[4:]: bank_npz[k].item() if bank_npz[k].ndim == 0 else bank_npz[k]
+                   for k in bank_npz.files if k.startswith("cal_")}
+            self._threshold = self._threshold_from_cal(cal)
+            self.threshold_label.configure(text=self._format_cal_label(cal, mode="saved"))
             status = f"Authenticating · bank: {Path(path).name}"
-        except Exception as exc:  # noqa: BLE001
-            self._threshold = 0.5
-            self.threshold_label.configure(text="τ = 0.5  (calibration failed — fallback)")
-            status = (f"Authenticating · bank: {Path(path).name} · "
-                      f"calibration failed ({exc})")
+        else:
+            # No saved calibration → run the Aalto-proxy live calibration (~15s).
+            self.engine_status.configure(text=f"Calibrating threshold for {Path(path).name} …")
+            self.root.update_idletasks()
+            try:
+                cal = calibrate_threshold(self.engine, bank_npz["windows"], n_users=20)
+                self._threshold = self._threshold_from_cal(cal)
+                self.threshold_label.configure(text=self._format_cal_label(cal, mode="Aalto proxy"))
+                status = f"Authenticating · bank: {Path(path).name}"
+            except Exception as exc:  # noqa: BLE001
+                self._threshold = 0.5
+                self.threshold_label.configure(text="τ = 0.5  (calibration failed — fallback)")
+                status = (f"Authenticating · bank: {Path(path).name} · "
+                          f"calibration failed ({exc})")
 
         self._mode = "auth"
         self._clear_stream()
@@ -460,18 +521,25 @@ class KeyboardAuthApp:
         self._update_counter()
 
     def _save_enrollment(self) -> None:
-        """Multi-session enrollment state machine.
+        """Multi-session enrollment + self-calibration state machine.
 
-        Press 1 (idle → enroll): begin capturing session 1. Button = "Add session".
-        Press 2..ENROLL_SESSIONS (enroll, after typing ≥ MIN_PER_SESSION keys): append
-            current stream as a session, clear the buffer, prompt for the next session.
-            Once ENROLL_SESSIONS collected, button = "Finish enrollment".
-        Final press: build_bank_windows distributes BANK_K windows across the collected
-            sessions (mirrors training's multi_session=True), save, return to idle.
+        idle → enroll: begin session 1. Button = "Add session".
+        enroll, sessions < ENROLL_SESSIONS: append session on each press.
+            Once all collected, button = "Finish enrollment".
+        enroll, finish: build bank, save, transition to verify mode. Button = "Finish calibration".
+        verify: user types ≥ VERIFY_KEYS of genuine traffic. On press, score against the
+            saved bank for the *real* genuine distribution, calibrate τ vs Aalto impostors,
+            re-save bank with cal metadata, return to idle.
         """
         if self.engine is None:
             return
 
+        # ── verify mode: finalize self-calibration ────────────────────────────
+        if self._mode == "verify":
+            self._finalize_calibration()
+            return
+
+        # ── idle → start enrollment ───────────────────────────────────────────
         if self._mode != "enroll":
             self._mode = "enroll"
             self._enrollment_sessions = []
@@ -484,7 +552,7 @@ class KeyboardAuthApp:
             self._update_counter()
             return
 
-        # Already collected all sessions → this press finalises.
+        # ── enroll, all sessions captured → finalize bank + enter verify ──────
         if len(self._enrollment_sessions) >= ENROLL_SESSIONS:
             all_windows = build_bank_windows(
                 self._enrollment_sessions, seq_len=SEQ_LEN, k=BANK_K
@@ -495,16 +563,21 @@ class KeyboardAuthApp:
             save_bank(all_windows, path=save_path)
             self.engine.set_bank_from_windows(all_windows)
             self._enrollment_sessions = []
-            self._mode = "idle"
-            self.enroll_button.configure(text="Save enrollment")
+
+            # Stash for verification → we re-save with calibration on finalize.
+            self._verify_bank_path = save_path
+            self._verify_bank_windows = all_windows
+            self._mode = "verify"
+            self.enroll_button.configure(text="Finish calibration")
             self.engine_status.configure(
-                text=f"Enrolled · {all_windows.shape[0]} windows · saved to {save_path.name} "
-                     f"· 'Start auth' to score"
+                text=f"Bank saved · type ≥ {VERIFY_KEYS} keys of your normal typing, "
+                     f"then click 'Finish calibration'"
             )
             self._clear_stream()
+            self._update_counter()
             return
 
-        # Mid-enrollment: capture the current stream as one session.
+        # ── enroll, mid-flight: capture current stream as a session ───────────
         feats = self._current_features()
         n = 0 if feats is None else len(feats)
         if feats is None or n < MIN_PER_SESSION:
@@ -528,10 +601,49 @@ class KeyboardAuthApp:
             )
         self._update_counter()
 
+    def _finalize_calibration(self) -> None:
+        """Self-calibrate τ using the user's own verification stream + Aalto impostors."""
+        feats = self._current_features()
+        n = 0 if feats is None else len(feats)
+        if feats is None or n < VERIFY_KEYS:
+            self.engine_status.configure(
+                text=f"Need at least {VERIFY_KEYS} verification keys (got {n}) — keep typing"
+            )
+            return
+
+        self.engine_status.configure(text="Calibrating with your genuine typing …")
+        self.root.update_idletasks()
+        try:
+            cal = calibrate_threshold(
+                self.engine, self._verify_bank_windows,
+                n_users=20, real_genuine_events=feats,
+            )
+            self._threshold = self._threshold_from_cal(cal)
+            save_bank(self._verify_bank_windows,
+                      path=self._verify_bank_path, calibration=cal)
+            self.threshold_label.configure(text=self._format_cal_label(
+                cal, mode=f"self-calibrated, n={cal['n_genuine']}"))
+            self.engine_status.configure(
+                text=f"Self-calibrated · saved to {self._verify_bank_path.name} "
+                     f"· 'Start auth' to score"
+            )
+        except Exception as exc:  # noqa: BLE001
+            self.engine_status.configure(
+                text=f"Calibration failed: {exc} — bank still saved without τ"
+            )
+
+        self._verify_bank_path = None
+        self._verify_bank_windows = None
+        self._mode = "idle"
+        self.enroll_button.configure(text="Save enrollment")
+        self._clear_stream()
+
     def _reset_all(self) -> None:
-        """Hard reset: live buffer + enrollment state + return to idle mode."""
+        """Hard reset: live buffer + enrollment/verify state + return to idle mode."""
         self._enrollment_sessions = []
-        if self._mode == "enroll":
+        self._verify_bank_path = None
+        self._verify_bank_windows = None
+        if self._mode in ("enroll", "verify"):
             self.enroll_button.configure(text="Save enrollment")
         self._mode = "idle"
         self._clear_stream()
@@ -565,10 +677,12 @@ def _demo_rows() -> list[KeystrokeRow]:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Keyboard authentication interface")
     parser.add_argument("--demo", action="store_true", help="launch with sample probability and keystrokes")
+    parser.add_argument("--debug", action="store_true",
+                        help="log per-window p_t to stderr (diagnostics)")
     args = parser.parse_args()
 
     root = tk.Tk()
-    app = KeyboardAuthApp(root)
+    app = KeyboardAuthApp(root, debug_log=args.debug)
 
     if args.demo:
         app.set_probability(0.23)

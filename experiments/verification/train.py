@@ -7,7 +7,7 @@ Early stopping: val_loss. Checkpoint: best val_loss saved to best_models/.
 
 Usage:
     cd <project_root>
-    python -m experiments.AaltoDB.stage1_encoder.train [epochs]
+    python -m experiments.verification.train [epochs]
 """
 
 import json
@@ -30,11 +30,11 @@ _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(_PROJECT_ROOT))
 
 from data.AaltoDB.prepare import load as load_aalto  # noqa: E402
-from data.AaltoDB.stage_1 import PureWindowDataset  # noqa: E402
 from data.AaltoDB.stats import aalto_feature_ranges, aalto_vocab_size  # noqa: E402
+from data.AaltoDB.windows import PureWindowDataset  # noqa: E402
 from evaluation.metrics import Metric  # noqa: E402
 from experiments.config import parse_runtime_config  # noqa: E402
-from experiments.stage1_encoder.model import Encoder  # noqa: E402
+from experiments.verification.model import Encoder  # noqa: E402
 from utils.config import seed_training  # noqa: E402
 from utils.logger import get_logger  # noqa: E402
 from utils.optimizers import MultiOptimizer, build_muon_hybrid  # noqa: E402

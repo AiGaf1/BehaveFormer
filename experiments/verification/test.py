@@ -9,7 +9,7 @@ Reports:
 
 Usage:
     cd <project_root>
-    python -m experiments.stage1_encoder.test [checkpoint.ckpt]
+    python -m experiments.verification.test [checkpoint.ckpt]
 """
 
 import re
@@ -24,22 +24,23 @@ _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(_PROJECT_ROOT))
 
 from data.AaltoDB.prepare import load as load_aalto  # noqa: E402
-from data.AaltoDB.stage_1 import PureWindowDataset  # noqa: E402
-from data.AaltoDB.stage_2 import ENROLL_END, load_streams  # noqa: E402
+from data.AaltoDB.windows import PureWindowDataset  # noqa: E402
+from data.AaltoDB.streams import ENROLL_END, load_streams  # noqa: E402
 from data.AaltoDB.stats import aalto_feature_ranges, aalto_vocab_size  # noqa: E402
 from evaluation.metrics import Metric  # noqa: E402
-from evaluation.stage1 import encode_windows  # noqa: E402
-from evaluation.stage2 import build_user_template, score_stream_baseline  # noqa: E402
-from experiments.stage1_encoder.model import Encoder  # noqa: E402
-from experiments.stage1_encoder.train import (  # noqa: E402
+from evaluation.ca_baseline import build_user_template, score_stream_baseline  # noqa: E402
+from evaluation.verification import behaveformer_eer, encode_windows  # noqa: E402
+from experiments.verification.model import Encoder  # noqa: E402
+from experiments.verification.train import (  # noqa: E402
     DROPOUT,
     HEADS,
     KEY_EMB,
     LFF_FEATURES,
     NUM_LAYERS,
-    SAMPLES_PER_USER,
     SEQ_LEN,
 )
+
+SAMPLES_PER_USER = 8   # legacy: pairs_per_user for PureWindowDataset pairwise EER
 from utils.logger import get_logger  # noqa: E402
 
 LOGGER = get_logger(__name__)
@@ -64,12 +65,13 @@ def test(ckpt_path: Path | None = None):
     LOGGER.info(f"Loading checkpoint: {ckpt_path.name}")
 
     train_data, _, test_data = load_aalto()
+    ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
     encoder = Encoder(
         seq_len=SEQ_LEN, vocab_size=aalto_vocab_size(train_data),
         key_emb=KEY_EMB, feature_ranges=aalto_feature_ranges(train_data),
         lff_features=LFF_FEATURES, num_layers=NUM_LAYERS, heads=HEADS, dropout=DROPOUT,
     ).to(device)
-    state = torch.load(ckpt_path, map_location=device, weights_only=False)["state_dict"]
+    state = ckpt["state_dict"]
     encoder.load_state_dict({k.removeprefix("encoder."): v for k, v in state.items()
                              if k.startswith("encoder.")})
     encoder.eval()
@@ -93,6 +95,21 @@ def test(ckpt_path: Path | None = None):
     LOGGER.info(f"  EER={eer:.2f}%  threshold={thr:.4f}  AUC={auc:.4f}")
     tar_str = "  ".join(f"FAR={far*100:.2f}%→TAR={tar*100:.2f}%" for far, tar in tar_far.items())
     LOGGER.info(f"  {tar_str}")
+
+    # ── BehaveFormer protocol (IJCB 2023) verification — directly comparable ──
+    LOGGER.info("Verification — BehaveFormer protocol (5-session enrollment, mean Euclidean)")
+    for n_users in (1000, len(test_data)):
+        bf = behaveformer_eer(encoder, test_data, SEQ_LEN, device,
+                              n_enroll=5, max_users=n_users, seed=0)
+        LOGGER.info(f"  N_test_users={bf['n_users']:,}  E={bf['n_enroll']}  "
+                    f"genuine={bf['n_genuine']:,}  impostor={bf['n_impostor']:,}")
+        LOGGER.info(f"  EER={bf['eer']:.2f}%  AUC={bf['auc']:.4f}  "
+                    f"thr_dist={bf['threshold_dist']:.4f}")
+        tar_str_bf = "  ".join(f"FAR={far*100:.2f}%→TAR={tar*100:.2f}%"
+                               for far, tar in bf["tar_at_far"].items())
+        LOGGER.info(f"  {tar_str_bf}")
+        if n_users >= len(test_data):
+            break  # avoid re-running when test split < 1000
 
     fig, ax = plt.subplots(figsize=(7, 4))
     ax.hist(scores_g.cpu().numpy(), bins=80, alpha=0.6, label="genuine",  density=True, color="C0")
@@ -123,17 +140,8 @@ def test(ckpt_path: Path | None = None):
     streams = load_streams()
     test_streams   = [s for s in streams["test"]        if s["user_idx"] in templates]
     single_streams = [s for s in streams["test_single"] if s["user_idx"] in templates]
-    # Subsample to keep evaluation tractable; tweak MAX_STREAMS if you want full coverage
-    MAX_STREAMS = 2000
     attacks   = [s for s in test_streams if s["stream_type"] == "attack"]
     same_user = [s for s in test_streams if s["stream_type"] == "same_user"]
-    half = MAX_STREAMS // 2
-    if len(attacks) > half:
-        attacks = [attacks[i] for i in rng.choice(len(attacks), half, replace=False)]
-    if len(same_user) > half:
-        same_user = [same_user[i] for i in rng.choice(len(same_user), half, replace=False)]
-    if len(single_streams) > MAX_STREAMS:
-        single_streams = [single_streams[i] for i in rng.choice(len(single_streams), MAX_STREAMS, replace=False)]
     LOGGER.info(f"CA eval streams: attack={len(attacks):,}  same_user={len(same_user):,}  single={len(single_streams):,}")
     score_fn = lambda s: score_stream_baseline(s, encoder, templates, SEQ_LEN, device)  # noqa: E731
     ca = Metric.evaluate_streams(score_fn, attacks + same_user, single_streams, n_thresholds=100)

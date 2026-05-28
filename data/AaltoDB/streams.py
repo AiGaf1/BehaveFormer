@@ -169,23 +169,6 @@ class StreamDataset(Dataset):
         }
 
 
-class EnrollmentDataset(Dataset):
-    """All windows from a user's enrollment sessions (for bank building)."""
-
-    def __init__(self, enroll_sessions: list, seq_len: int, columns: list | None = None):
-        self._windows: list[np.ndarray] = []
-        for session in enroll_sessions:
-            arr = (session if columns is None else session[:, columns]).astype(np.float32)
-            if len(arr) >= seq_len:
-                self._windows.extend(arr[i: i + seq_len] for i in range(len(arr) - seq_len + 1))
-
-    def __len__(self) -> int:
-        return len(self._windows)
-
-    def __getitem__(self, idx: int) -> torch.Tensor:
-        return torch.from_numpy(self._windows[idx])
-
-
 def stream_collate(batch):
     """Collate (window, label, meta) triples from StreamDataset(include_meta=True)."""
     windows  = torch.stack([w for w, _, _ in batch])
@@ -194,6 +177,88 @@ def stream_collate(batch):
     t_star   = torch.tensor([m["t_star"]   for _, _, m in batch], dtype=torch.long)
     w_start  = torch.tensor([m["w_start"]  for _, _, m in batch], dtype=torch.long)
     return windows, labels, user_idx, t_star, w_start
+
+
+class StreamLevelDataset(Dataset):
+    """Each item = one full stream's windows + per-window labels + meta.
+
+    __getitem__(i) returns dict with:
+      windows  : (n_i, seq_len, F) float32
+      labels   : (n_i,) float        — 1 if any event in window is post-attack
+      w_starts : (n_i,) long
+      t_star   : int
+      user_idx : int
+    Streams with fewer than seq_len events are filtered out at __init__.
+
+    If `augment_epoch` is set, applies per-user timing augmentation (hold/flight
+    scale + IME strip) keyed by (epoch, user_idx). Banks in the training step
+    must apply the SAME (epoch, user_idx) params or the bank↔stream
+    relationship breaks. See `data.augment.timing`.
+    """
+
+    def __init__(self, streams: list, seq_len: int, columns: list | None = None,
+                 augment_epoch: int | None = None):
+        self.seq_len = seq_len
+        self.columns = columns
+        self.augment_epoch = augment_epoch
+        self._streams = [s for s in streams if len(s["events"]) >= seq_len]
+
+    def __len__(self) -> int:
+        return len(self._streams)
+
+    def __getitem__(self, idx: int) -> dict:
+        stream = self._streams[idx]
+        events = stream["events"]
+        if self.columns is not None:
+            events = events[:, self.columns]
+        events = events.astype(np.float32)
+        if self.augment_epoch is not None:
+            from data.augment.timing import _params_for, apply_np
+            params = _params_for(self.augment_epoch, int(stream["user_idx"]))
+            events = apply_np(events, params)
+        n = len(events) - self.seq_len + 1
+        windows = np.stack([events[i: i + self.seq_len] for i in range(n)])
+        labels_arr = stream["labels"]
+        labels = np.array(
+            [labels_arr[i: i + self.seq_len].any() for i in range(n)],
+            dtype=np.float32,
+        )
+        return {
+            "windows":  torch.from_numpy(windows),
+            "labels":   torch.from_numpy(labels),
+            "w_starts": torch.arange(n, dtype=torch.long),
+            "t_star":   int(stream["t_star"]),
+            "user_idx": int(stream["user_idx"]),
+        }
+
+
+def stream_session_collate(batch):
+    """Flatten a list of B stream dicts into a single batch.
+
+    Returns:
+      windows   : (total_windows, seq_len, F)
+      labels    : (total_windows,)
+      user_idx  : (total_windows,)   — repeated per window
+      t_star    : (total_windows,)   — repeated per window
+      w_start   : (total_windows,)
+      stream_id : (total_windows,)   — 0..B-1, groups windows by stream
+    """
+    windows  = torch.cat([item["windows"]  for item in batch], dim=0)
+    labels   = torch.cat([item["labels"]   for item in batch], dim=0)
+    w_start  = torch.cat([item["w_starts"] for item in batch], dim=0)
+    user_idx = torch.cat([
+        torch.full((len(item["windows"]),), item["user_idx"], dtype=torch.long)
+        for item in batch
+    ])
+    t_star = torch.cat([
+        torch.full((len(item["windows"]),), item["t_star"], dtype=torch.long)
+        for item in batch
+    ])
+    stream_id = torch.cat([
+        torch.full((len(item["windows"]),), i, dtype=torch.long)
+        for i, item in enumerate(batch)
+    ])
+    return windows, labels, user_idx, t_star, w_start, stream_id
 
 
 if __name__ == "__main__":

@@ -1,3 +1,6 @@
+# user banks
+app/banks/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
@@ -30,10 +33,18 @@ env.bak/
 venv.bak/
 
 # Training instances
-checkpoints
-best_models
+checkpoints/
+best_models*/
 
-#Data
+# Figures (debug plots; commit paper figures explicitly if needed)
+figures/
+app/figures/
+
+# Data caches
 data/AaltoDB/prep_data/
+data/AaltoDB/prepared/
 data/HMOGDB/prep_data/
+*.pkl
+
+# W&B
 wandb/
